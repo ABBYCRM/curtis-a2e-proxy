@@ -275,7 +275,17 @@ app.get('/gemini/videos/:op', async (req, res) => {
 async function forwardJson(r, res) {
   const text = await r.text();
   let j; try { j = JSON.parse(text); } catch { j = { raw: text }; }
-  return res.status(r.ok ? 200 : r.status).json(j);
+  // Normalize: A2E returns structured business errors as
+  // {code: <nonzero>, msg, trace_id}. Forward them as HTTP 200 so the
+  // front-end can read the structured error. Only pass through non-2xx
+  // when the response is not parseable JSON or the upstream itself
+  // returned a 5xx (real failure, not a business rejection).
+  const isA2EStructuredError = j && typeof j.code === 'number' && j.code !== 0;
+  const isUpstreamServerError = r.status >= 500;
+  const status = (!r.ok && !isA2EStructuredError) || isUpstreamServerError
+    ? r.status
+    : 200;
+  return res.status(status).json(j);
 }
 
 /* ---------- listen ---------- */
