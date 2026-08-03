@@ -139,7 +139,11 @@ app.post('/a2e', async (req, res) => {
 // Create a video generation job
 app.post('/openai/videos', async (req, res) => {
   const KEY = PROVIDERS.openai.getKey();
-  if (!KEY) return res.status(500).json({ error: { message: 'OPENAI_API_KEY not configured' } });
+  if (!KEY) return res.status(500).json({
+    error: { message: 'OPENAI_API_KEY not configured on the proxy' },
+    friendly: 'OpenAI key is not set on the proxy. Open Render → your service → Environment, add OPENAI_API_KEY, then paste the same key in the app\'s Settings tab.',
+    retryable: false,
+  });
   try {
     const { model = 'sora-2', prompt, size = '1280x720', seconds = '4',
             input_reference, /* base64 or url of reference image (face lock) */
@@ -165,14 +169,22 @@ app.post('/openai/videos', async (req, res) => {
     return forwardJson(r, res);
   } catch (e) {
     console.error('[openai create]', e);
-    return res.status(500).json({ error: { message: e.message } });
+    return res.status(500).json({
+      error: { message: e.message },
+      friendly: 'OpenAI request failed. Check your network and try again.',
+      retryable: true,
+    });
   }
 });
 
 // Poll a video job
 app.get('/openai/videos/:id', async (req, res) => {
   const KEY = PROVIDERS.openai.getKey();
-  if (!KEY) return res.status(500).json({ error: { message: 'OPENAI_API_KEY not configured' } });
+  if (!KEY) return res.status(500).json({
+    error: { message: 'OPENAI_API_KEY not configured on the proxy' },
+    friendly: 'OpenAI key is not set on the proxy. Open Render → your service → Environment, add OPENAI_API_KEY, then paste the same key in the app\'s Settings tab.',
+    retryable: false,
+  });
   try {
     const r = await fetch(`${PROVIDERS.openai.base}/v1/videos/${encodeURIComponent(req.params.id)}`, {
       headers: { 'Authorization': `Bearer ${KEY}` },
@@ -186,7 +198,11 @@ app.get('/openai/videos/:id', async (req, res) => {
 // Download the finished MP4 (proxy streams it through so CORS works)
 app.get('/openai/videos/:id/content', async (req, res) => {
   const KEY = PROVIDERS.openai.getKey();
-  if (!KEY) return res.status(500).json({ error: { message: 'OPENAI_API_KEY not configured' } });
+  if (!KEY) return res.status(500).json({
+    error: { message: 'OPENAI_API_KEY not configured on the proxy' },
+    friendly: 'OpenAI key is not set on the proxy. Open Render → your service → Environment, add OPENAI_API_KEY, then paste the same key in the app\'s Settings tab.',
+    retryable: false,
+  });
   try {
     const variant = req.query.variant || 'mp4';
     const r = await fetch(`${PROVIDERS.openai.base}/v1/videos/${encodeURIComponent(req.params.id)}/content?variant=${variant}`, {
@@ -194,7 +210,12 @@ app.get('/openai/videos/:id/content', async (req, res) => {
     });
     if (!r.ok) {
       const text = await r.text();
-      return res.status(r.status).send(text);
+      let j; try { j = JSON.parse(text); } catch { j = { raw: text }; }
+      return res.status(r.status).json({
+        ...j,
+        friendly: friendlyOpenAI(j),
+        retryable: r.status >= 500,
+      });
     }
     res.setHeader('Content-Type', r.headers.get('content-type') || 'video/mp4');
     res.setHeader('Content-Disposition', `attachment; filename="openai-${req.params.id}.${variant}"`);
@@ -208,7 +229,11 @@ app.get('/openai/videos/:id/content', async (req, res) => {
 // OpenAI usage — for the spend cap guard
 app.get('/openai/usage', async (req, res) => {
   const KEY = PROVIDERS.openai.getKey();
-  if (!KEY) return res.status(500).json({ error: { message: 'OPENAI_API_KEY not configured' } });
+  if (!KEY) return res.status(500).json({
+    error: { message: 'OPENAI_API_KEY not configured on the proxy' },
+    friendly: 'OpenAI key is not set on the proxy. Open Render → your service → Environment, add OPENAI_API_KEY, then paste the same key in the app\'s Settings tab.',
+    retryable: false,
+  });
   try {
     // OpenAI's usage endpoint requires admin scope for org-wide, but
     // account-level usage is at /v1/usage with date range query.
@@ -232,7 +257,11 @@ app.get('/openai/usage', async (req, res) => {
    ============================================================================ */
 app.post('/gemini/videos', async (req, res) => {
   const KEY = PROVIDERS.gemini.getKey();
-  if (!KEY) return res.status(500).json({ error: { message: 'GEMINI_API_KEY not configured' } });
+  if (!KEY) return res.status(500).json({
+    error: { message: 'GEMINI_API_KEY not configured on the proxy' },
+    friendly: 'Gemini key is not set on the proxy. Open Render → your service → Environment, add GEMINI_API_KEY.',
+    retryable: false,
+  });
   try {
     const { model = 'veo-3.1-generate-preview', prompt, image_url, aspect_ratio = '16:9' } = req.body || {};
     if (!prompt) return res.status(400).json({ error: { message: 'prompt required' } });
@@ -260,7 +289,11 @@ app.post('/gemini/videos', async (req, res) => {
 
 app.get('/gemini/videos/:op', async (req, res) => {
   const KEY = PROVIDERS.gemini.getKey();
-  if (!KEY) return res.status(500).json({ error: { message: 'GEMINI_API_KEY not configured' } });
+  if (!KEY) return res.status(500).json({
+    error: { message: 'GEMINI_API_KEY not configured on the proxy' },
+    friendly: 'Gemini key is not set on the proxy. Open Render → your service → Environment, add GEMINI_API_KEY.',
+    retryable: false,
+  });
   try {
     const r = await fetch(
       `${PROVIDERS.gemini.base}/v1beta/${decodeURIComponent(req.params.op)}?key=${KEY}`
@@ -285,7 +318,61 @@ async function forwardJson(r, res) {
   const status = (!r.ok && !isA2EStructuredError) || isUpstreamServerError
     ? r.status
     : 200;
+
+  // Tag the error so the front-end knows whether to retry, surface a
+  // friendly message, or block the run entirely.
+  if(isA2EStructuredError){
+    j.friendly = friendlyA2E(j);
+    j.retryable = false;  // structured business errors don't get better on retry
+  } else if(isUpstreamServerError){
+    j.friendly = 'The provider is having trouble. Try again in a minute.';
+    j.retryable = true;
+  } else if(!r.ok){
+    j.friendly = `Provider returned HTTP ${r.status}.`;
+    j.retryable = r.status >= 500;
+  }
   return res.status(status).json(j);
+}
+
+function friendlyA2E(j){
+  const msg = (j.msg || j.message || '').toLowerCase();
+  if(msg.includes('free user') || msg.includes('pro or max')){
+    return 'Your A2E account is on the Free plan. The API requires Pro or Max. Upgrade at video.a2e.ai → Account → Plan.';
+  }
+  if(msg.includes('unauthorized') || msg.includes('401') || msg.includes('invalid token')){
+    return 'The A2E API key is wrong or expired. Generate a new one in the A2E dashboard and paste it in Settings.';
+  }
+  if(msg.includes('quota') || msg.includes('insufficient')){
+    return 'You\'ve run out of A2E credits. Top up at video.a2e.ai.';
+  }
+  if(msg.includes('rate limit') || msg.includes('too many')){
+    return 'A2E is rate-limiting you. Wait a minute and try again.';
+  }
+  return j.msg || j.message || 'A2E returned an error.';
+}
+
+function friendlyOpenAI(j){
+  const code = j?.error?.code;
+  const msg = (j?.error?.message || '').toLowerCase();
+  if(code === 'invalid_api_key' || msg.includes('incorrect api key') || msg.includes('invalid api key')){
+    return 'The OpenAI key is wrong or revoked. Generate a new one at platform.openai.com → API keys, then paste it in Settings.';
+  }
+  if(msg.includes('insufficient_quota') || msg.includes('billing') || msg.includes('payment')){
+    return 'OpenAI says you\'re out of credit. Add a payment method at platform.openai.com → Billing.';
+  }
+  if(msg.includes('sora') && (msg.includes('deprecat') || msg.includes('shutdown'))){
+    return 'Sora 2 is shutting down on 2026-09-24. The proxy doesn\'t have access to the successor model yet. Use A2E for now.';
+  }
+  if(msg.includes('rate_limit') || msg.includes('too many requests')){
+    return 'OpenAI is rate-limiting you. Wait a minute and try again.';
+  }
+  if(msg.includes('content_policy') || msg.includes('safety') || msg.includes('rejected')){
+    return 'OpenAI rejected the prompt as unsafe. Try rewording the script.';
+  }
+  if(msg.includes('model') && msg.includes('not found')){
+    return 'The selected OpenAI model doesn\'t exist or you don\'t have access. Try sora-2 (the cheaper one).';
+  }
+  return j?.error?.message || 'OpenAI returned an error.';
 }
 
 /* ---------- listen ---------- */
