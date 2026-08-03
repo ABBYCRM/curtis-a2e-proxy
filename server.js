@@ -14,7 +14,18 @@ const express = require('express');
 const cors = require('cors');
 
 const app = express();
-app.use(cors({ origin: '*' }));                // allow any origin (static front-end)
+// CORS: allow only the official Trailer Studio origin (and localhost for dev).
+// Open `origin: '*'` would let anyone on the internet use your A2E key.
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
+  'https://curtis-image-gen.onrender.com,http://localhost:8080,http://127.0.0.1:8080'
+).split(',').map(s => s.trim()).filter(Boolean);
+app.use(cors({
+  origin: (origin, cb) => {
+    // Allow same-origin (no Origin header) and allowlisted origins
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error(`CORS: origin ${origin} not allowed`));
+  }
+}));
 app.use(express.json({ limit: '10mb' }));
 
 const A2E_BASE = process.env.A2E_BASE_URL || 'https://video.a2e.ai';
@@ -61,9 +72,15 @@ app.post('/a2e', async (req, res) => {
       }
       case 'image_status': {
         if (!req.body.id) return res.status(400).json({ code: -1, message: 'id required' });
-        upstreamPath = `/api/v1/userNanoBanana/detail/${encodeURIComponent(req.body.id)}`;
-        upstreamBody = {};
-        break;
+        // A2E NanoBanana detail endpoint is GET (verified from A2E docs).
+        // POST returns 404, so handle this case inline like video_status.
+        const r = await fetch(`${A2E_BASE}/api/v1/userNanoBanana/detail/${encodeURIComponent(req.body.id)}`, {
+          method: 'GET',
+          headers: { 'Authorization': `Bearer ${A2E_KEY}` },
+        });
+        const text = await r.text();
+        let j; try { j = JSON.parse(text); } catch { j = { raw: text }; }
+        return res.status(r.ok ? 200 : r.status).json(j);
       }
       case 'video_start': {
         upstreamPath = '/api/v1/userImage2Video/start';
