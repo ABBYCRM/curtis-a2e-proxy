@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const dns = require('dns').promises;
 const net = require('net');
+const sharp = require('sharp');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -178,6 +179,30 @@ function parseDataUrl(value) {
   if (!match) return null;
   const bytes = Buffer.from(match[2].replace(/\s/g, ''), 'base64');
   return { mime: match[1], bytes };
+}
+
+// Read PNG dimensions from the IHDR chunk (bytes 16-23, big-endian).
+// Returns {width, height} or null if the bytes aren't a PNG.
+// We only need this so Sora 2 doesn't reject a 1024x1024 reference when
+// the requested size is 1280x720 ("Inpaint image must match the
+// requested width and height").
+function pngDims(bytes) {
+  if (bytes.length < 24) return null;
+  if (bytes[0] !== 0x89 || bytes[1] !== 0x50 || bytes[2] !== 0x4e || bytes[3] !== 0x47) return null;
+  if (bytes[12] !== 0x49 || bytes[13] !== 0x48 || bytes[14] !== 0x44 || bytes[15] !== 0x52) return null;
+  return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+}
+
+// Pick the Sora 2 size that best matches a reference image's aspect ratio.
+// Sora 2 only supports 720x1280 and 1280x720. We snap the reference's
+// aspect to one of those two.
+function soraSizeForRef(refDims, requested) {
+  if (!refDims || !refDims.width || !refDims.height) return requested || '1280x720';
+  const refIsPortrait = refDims.height > refDims.width;
+  // If the requested size matches the reference's orientation, keep it.
+  const reqIsPortrait = requested && requested.startsWith('720x');
+  if (reqIsPortrait === refIsPortrait) return requested;
+  return refIsPortrait ? '720x1280' : '1280x720';
 }
 
 function isPrivateAddress(address) {
@@ -369,14 +394,33 @@ app.post('/openai/videos', async (req, res, next) => {
       ? req.body.input_reference.trim()
       : null;
 
+    // If the caller supplied a reference image, resize it to exactly the
+    // requested size. Sora 2 strictly requires the inpaint reference to
+    // match the requested width/height — it returns 422 "Inpaint image
+    // must match the requested width and height" otherwise. We use sharp
+    // to cover the reference to the target size (aspect-preserving, then
+    // pad to the exact dimensions with the inverse color of the request).
+    let finalReference = reference;
+    if (reference) {
+      const data = parseDataUrl(reference);
+      if (data) {
+        const [w, h] = size.split('x').map(Number);
+        const padded = await sharp(data.bytes)
+          .resize(w, h, { fit: 'cover', position: 'centre' })
+          .png()
+          .toBuffer();
+        finalReference = `data:image/png;base64,${padded.toString('base64')}`;
+      }
+    }
+
     // Sora 2 expects `input_reference` as an OBJECT in JSON requests
     // ({ file_id } or { image_url }). A bare string or a data URL is rejected
     // with "Invalid type for 'input_reference': expected an object".
     // We forward the reference as { image_url } so the upstream can fetch
     // it. data: URLs are passed through as-is — OpenAI accepts them.
     const body = { model, prompt, size, seconds };
-    if (reference) {
-      body.input_reference = { image_url: reference };
+    if (finalReference) {
+      body.input_reference = { image_url: finalReference };
     }
 
     const response = await upstreamFetch(`${PROVIDERS.openai.base}/v1/videos`, {
