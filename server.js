@@ -45,6 +45,39 @@ const PROVIDERS = {
   },
 };
 
+/* ---------- Key resolution ----------
+   The user can paste their key in the app's Settings tab and the front-end
+   sends it on every request via:
+     x-a2e-key:    ...
+     x-openai-key: ...
+     x-gemini-key: ...
+   The proxy prefers the per-request key over the env var, so the operator
+   doesn't need to re-deploy just to add a key. The env var is still used
+   if the request doesn't include a header (back-compat with the operator's
+   own testing).
+   -------------------------------------------------------------------------- */
+function resolveKey(providerName, req){
+  const headerMap = {
+    a2e:    'x-a2e-key',
+    openai: 'x-openai-key',
+    gemini: 'x-gemini-key',
+  };
+  const h = headerMap[providerName];
+  const fromHeader = h ? (req.headers[h] || '').toString().trim() : '';
+  if(fromHeader) return { key: fromHeader, source: 'header' };
+  const fromEnv = PROVIDERS[providerName]?.getKey?.() || '';
+  if(fromEnv)     return { key: fromEnv, source: 'env' };
+  return { key: '', source: 'none' };
+}
+function keyErr(providerName){
+  const label = PROVIDERS[providerName]?.label || providerName;
+  return {
+    error: { message: `${providerName.toUpperCase()}_API_KEY not set (env or request header)` },
+    friendly: `${label} key is missing. Either paste it in the app's Settings tab, or set the env var on the proxy.`,
+    retryable: false,
+  };
+}
+
 /* ---------- Health + info ---------- */
 app.get('/', (_req, res) => res.json({
   name: 'curtis-api-proxy',
@@ -72,8 +105,8 @@ app.get('/healthz', (_req, res) => res.json({
 app.post('/a2e', async (req, res) => {
   const { action } = req.body || {};
   if (!action) return res.status(400).json({ code: -1, message: 'Missing action' });
-  const KEY = PROVIDERS.a2e.getKey();
-  if (!KEY) return res.status(500).json({ code: -1, message: 'A2E_API_KEY not configured' });
+  const { key: KEY } = resolveKey('a2e', req);
+  if (!KEY) return res.status(500).json({ code: -1, ...keyErr('a2e') });
   try {
     switch (action) {
       case 'image_start': {
@@ -139,10 +172,13 @@ app.post('/a2e', async (req, res) => {
    wrapped in {code, data, friendly, retryable} so the front-end can read it
    the same way it reads /a2e responses.
    ============================================================================ */
-async function a2eStatusFetch(kind, id){
+async function a2eStatusFetch(kind, id, req){
   if(!id) return { code: -1, message: 'id required', friendly: 'Missing job id.', retryable: false };
-  const KEY = PROVIDERS.a2e.getKey();
-  if(!KEY) return { code: -1, message: 'A2E_API_KEY not configured', friendly: 'A2E key missing on the proxy.', retryable: false };
+  // Prefer the per-request key (x-a2e-key header) so the user can paste
+  // their key in the app's Settings tab without needing to set the
+  // proxy's env var. Fall back to env for operator self-tests.
+  const { key: KEY } = resolveKey('a2e', req || { headers: {} });
+  if(!KEY) return { code: -1, ...keyErr('a2e') };
   const path = kind === 'video'
     ? `/api/v1/userImage2Video/${encodeURIComponent(id)}`
     : `/api/v1/userNanoBanana/detail/${encodeURIComponent(id)}`;
@@ -184,7 +220,7 @@ function handleA2eStatus(req, res){
   if(!resolvedKind){
     return res.status(400).json({ code: -1, message: 'kind (image|video) or action (image_status|video_status) required', friendly: 'Specify kind=image or kind=video in the poll request.', retryable: false });
   }
-  a2eStatusFetch(resolvedKind, id).then(j => res.json(j));
+  a2eStatusFetch(resolvedKind, id, req).then(j => res.json(j));
 }
 
 app.post('/a2e/status', handleA2eStatus);
@@ -199,12 +235,8 @@ app.get('/a2e/status',  handleA2eStatus);
 
 // Create a video generation job
 app.post('/openai/videos', async (req, res) => {
-  const KEY = PROVIDERS.openai.getKey();
-  if (!KEY) return res.status(500).json({
-    error: { message: 'OPENAI_API_KEY not configured on the proxy' },
-    friendly: 'OpenAI key is not set on the proxy. Open Render → your service → Environment, add OPENAI_API_KEY, then paste the same key in the app\'s Settings tab.',
-    retryable: false,
-  });
+  const { key: KEY } = resolveKey('openai', req);
+  if (!KEY) return res.status(500).json(keyErr('openai'));
   try {
     const { model = 'sora-2', prompt, size = '1280x720', seconds = '4',
             input_reference, /* base64 or url of reference image (face lock) */
@@ -240,12 +272,8 @@ app.post('/openai/videos', async (req, res) => {
 
 // Poll a video job
 app.get('/openai/videos/:id', async (req, res) => {
-  const KEY = PROVIDERS.openai.getKey();
-  if (!KEY) return res.status(500).json({
-    error: { message: 'OPENAI_API_KEY not configured on the proxy' },
-    friendly: 'OpenAI key is not set on the proxy. Open Render → your service → Environment, add OPENAI_API_KEY, then paste the same key in the app\'s Settings tab.',
-    retryable: false,
-  });
+  const { key: KEY } = resolveKey('openai', req);
+  if (!KEY) return res.status(500).json(keyErr('openai'));
   try {
     const r = await fetch(`${PROVIDERS.openai.base}/v1/videos/${encodeURIComponent(req.params.id)}`, {
       headers: { 'Authorization': `Bearer ${KEY}` },
@@ -258,12 +286,8 @@ app.get('/openai/videos/:id', async (req, res) => {
 
 // Download the finished MP4 (proxy streams it through so CORS works)
 app.get('/openai/videos/:id/content', async (req, res) => {
-  const KEY = PROVIDERS.openai.getKey();
-  if (!KEY) return res.status(500).json({
-    error: { message: 'OPENAI_API_KEY not configured on the proxy' },
-    friendly: 'OpenAI key is not set on the proxy. Open Render → your service → Environment, add OPENAI_API_KEY, then paste the same key in the app\'s Settings tab.',
-    retryable: false,
-  });
+  const { key: KEY } = resolveKey('openai', req);
+  if (!KEY) return res.status(500).json(keyErr('openai'));
   try {
     const variant = req.query.variant || 'mp4';
     const r = await fetch(`${PROVIDERS.openai.base}/v1/videos/${encodeURIComponent(req.params.id)}/content?variant=${variant}`, {
@@ -289,12 +313,8 @@ app.get('/openai/videos/:id/content', async (req, res) => {
 
 // OpenAI usage — for the spend cap guard
 app.get('/openai/usage', async (req, res) => {
-  const KEY = PROVIDERS.openai.getKey();
-  if (!KEY) return res.status(500).json({
-    error: { message: 'OPENAI_API_KEY not configured on the proxy' },
-    friendly: 'OpenAI key is not set on the proxy. Open Render → your service → Environment, add OPENAI_API_KEY, then paste the same key in the app\'s Settings tab.',
-    retryable: false,
-  });
+  const { key: KEY } = resolveKey('openai', req);
+  if (!KEY) return res.status(500).json(keyErr('openai'));
   try {
     // OpenAI's usage endpoint requires admin scope for org-wide, but
     // account-level usage is at /v1/usage with date range query.
@@ -317,12 +337,8 @@ app.get('/openai/usage', async (req, res) => {
    Shape: long-running predictLongRunning operation, poll until done.
    ============================================================================ */
 app.post('/gemini/videos', async (req, res) => {
-  const KEY = PROVIDERS.gemini.getKey();
-  if (!KEY) return res.status(500).json({
-    error: { message: 'GEMINI_API_KEY not configured on the proxy' },
-    friendly: 'Gemini key is not set on the proxy. Open Render → your service → Environment, add GEMINI_API_KEY.',
-    retryable: false,
-  });
+  const { key: KEY } = resolveKey('gemini', req);
+  if (!KEY) return res.status(500).json(keyErr('gemini'));
   try {
     const { model = 'veo-3.1-generate-preview', prompt, image_url, aspect_ratio = '16:9' } = req.body || {};
     if (!prompt) return res.status(400).json({ error: { message: 'prompt required' } });
@@ -349,12 +365,8 @@ app.post('/gemini/videos', async (req, res) => {
 });
 
 app.get('/gemini/videos/:op', async (req, res) => {
-  const KEY = PROVIDERS.gemini.getKey();
-  if (!KEY) return res.status(500).json({
-    error: { message: 'GEMINI_API_KEY not configured on the proxy' },
-    friendly: 'Gemini key is not set on the proxy. Open Render → your service → Environment, add GEMINI_API_KEY.',
-    retryable: false,
-  });
+  const { key: KEY } = resolveKey('gemini', req);
+  if (!KEY) return res.status(500).json(keyErr('gemini'));
   try {
     const r = await fetch(
       `${PROVIDERS.gemini.base}/v1beta/${decodeURIComponent(req.params.op)}?key=${KEY}`
