@@ -843,7 +843,13 @@ app.get('/album/:id', async (req, res, next) => {
     const stat = await fsp.stat(filePath);
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Content-Type', entry.mime);
-    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    // Use Vary: Origin so Cloudflare / browser caches don't accidentally
+    // serve a CORS-less response to a cross-origin fetch. Keep a short
+    // max-age (5 minutes) so the file revalidates after the user
+    // deletes / re-uploads; immutable would lock stale bytes in the
+    // browser cache for a year.
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Cache-Control', 'public, max-age=300');
     const range = req.headers.range;
     if (range) {
       const match = /^bytes=(\d+)-(\d+)?$/.exec(range);
