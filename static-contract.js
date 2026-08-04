@@ -10,6 +10,8 @@ for (const required of [
   'APP_PROXY_TOKEN',
   'assertPublicHttpsUrl',
   'AbortController',
+  'ALBUM_DIR',
+  'saveAssetToAlbum',
 ]) {
   if (!source.includes(required)) throw new Error(`Missing proxy contract: ${required}`);
 }

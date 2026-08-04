@@ -4,6 +4,9 @@ const express = require('express');
 const cors = require('cors');
 const dns = require('dns').promises;
 const net = require('net');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const path = require('path');
 const sharp = require('sharp');
 
 const app = express();
@@ -48,10 +51,13 @@ app.use(cors({
     return callback(new Error(`Origin not allowed: ${origin}`));
   },
   allowedHeaders: ['content-type', 'x-a2e-key', 'x-openai-key', 'x-app-token'],
-  methods: ['GET', 'POST', 'OPTIONS'],
+  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
   maxAge: 600,
 }));
-app.use(express.json({ limit: '12mb' }));
+app.use(express.json({ limit: '50mb' }));
+// Raw bytes for the album upload endpoint (we accept image/* and video/mp4
+// as raw request bodies, not as multipart, to keep the front-end simple).
+app.use('/album/upload', express.raw({ type: ['image/png', 'image/jpeg', 'image/webp', 'video/mp4', 'application/octet-stream'], limit: '50mb' }));
 
 const buckets = new Map();
 function rateLimit(req, res, next) {
@@ -357,7 +363,19 @@ app.post('/openai/images', async (req, res, next) => {
       });
     }
     const body = await readProviderJson(response, 'openai');
-    res.json({ ok: true, model, ...normalizeOpenAIImage(body) });
+    const normalized = normalizeOpenAIImage(body);
+    // Persist to the album (best-effort; failures here are logged but
+    // do not fail the image response — the user still gets their image).
+    const albumId = await saveAssetToAlbum({
+      kind: 'image',
+      url: normalized.image_url,
+      mime: 'image/png',
+      prompt,
+      title: prompt.slice(0, 80),
+      provider: 'openai',
+      scene_n: null,
+    }).catch((err) => { console.error('[proxy] album save failed:', err.message); return null; });
+    res.json({ ok: true, model, ...normalized, album_id: albumId || null });
   } catch (error) {
     next(error);
   }
@@ -486,6 +504,21 @@ app.get('/openai/videos/:id/content', async (req, res, next) => {
     res.setHeader('Content-Type', upstream.headers.get('content-type') || 'video/mp4');
     res.setHeader('Cache-Control', 'no-store');
     const buf = Buffer.from(await upstream.arrayBuffer());
+    // Persist to the album. We use the prompt from the original job — the
+    // front-end sends it in the x-scene-prompt header on the content fetch.
+    // (CORS-safe: this is a server-side read, not browser code.)
+    const scenePrompt = String(req.headers['x-scene-prompt'] || '').trim() || `Sora 2 clip ${id}`;
+    saveAssetToAlbum({
+      kind: 'video',
+      bytes: buf,
+      mime: 'video/mp4',
+      prompt: scenePrompt,
+      title: scenePrompt.slice(0, 80),
+      provider: 'openai',
+      scene_n: null,
+    }).then((assetId) => {
+      if (assetId) res.setHeader('x-album-id', assetId);
+    }).catch((err) => { console.error('[proxy] album save failed:', err.message); });
     res.end(buf);
   } catch (error) {
     next(error);
@@ -567,6 +600,297 @@ app.post('/a2e/status', async (req, res, next) => {
   } catch (error) {
     next(error);
   }
+});
+
+// ----- Album: persistent asset store (file-backed) -------------------------
+// We store every generated image and video clip so the user can revisit
+// them from the Album tab, even after the browser tab closes. The store
+// is file-backed (data/album/<id>.<ext> + data/album/index.json) so we
+// don't need Postgres. Render's free web service disk is ephemeral but
+// holds long enough between deploys for this to be useful, and we can
+// swap the storage layer for Postgres or S3 without changing the API.
+const ALBUM_DIR = path.join(__dirname, 'data', 'album');
+const ALBUM_INDEX = path.join(ALBUM_DIR, 'index.json');
+const MAX_ALBUM_ENTRIES = 500;  // cap the index; oldest are pruned
+const ALBUM_TOTAL_BYTES = Number(process.env.ALBUM_MAX_BYTES || 500 * 1024 * 1024);  // 500 MB default
+
+// Save an asset to the album. `url` may be a data: URL, an https: URL,
+// or a Buffer (for video bytes fetched upstream). Returns the new asset id.
+async function saveAssetToAlbum({ kind, url, bytes, mime, prompt, title, provider, scene_n }) {
+  if (!['image', 'video'].includes(kind)) throw new Error('kind must be image or video');
+  if (!mime) throw new Error('mime is required');
+
+  let buffer = null;
+  if (Buffer.isBuffer(bytes)) {
+    buffer = bytes;
+  } else if (typeof url === 'string' && url.startsWith('data:')) {
+    const parsed = parseDataUrl(url);
+    if (!parsed) throw new Error('Invalid data URL');
+    buffer = parsed.bytes;
+  } else if (typeof url === 'string' && /^https?:$/.test(new URL(url).protocol)) {
+    const res = await upstreamFetch(url);
+    if (!res.ok) throw new Error(`Failed to fetch asset URL: HTTP ${res.status}`);
+    buffer = Buffer.from(await res.arrayBuffer());
+  } else {
+    throw new Error('Asset must be a data URL, https URL, or Buffer');
+  }
+  if (buffer.length === 0) throw new Error('Empty asset');
+
+  await ensureAlbumDir();
+  const id = makeAssetId();
+  const ext = extForMime(mime);
+  await fsp.writeFile(path.join(ALBUM_DIR, `${id}.${ext}`), buffer);
+
+  let width = null;
+  let height = null;
+  if (kind === 'image' && mime === 'image/png') {
+    try {
+      const probe = await sharp(buffer).metadata();
+      width = probe.width || null;
+      height = probe.height || null;
+    } catch { /* ignore */ }
+  }
+
+  const meta = {
+    id,
+    kind,
+    mime,
+    ext,
+    bytes: buffer.length,
+    prompt: prompt ? String(prompt).slice(0, 1000) : null,
+    title: title ? String(title).slice(0, 200) : null,
+    provider: provider || null,
+    scene_n: typeof scene_n === 'number' ? scene_n : null,
+    width,
+    height,
+    createdAt: Date.now(),
+  };
+  const entries = await readAlbumIndex();
+  entries.push(meta);
+  await writeAlbumIndex(entries);
+  await enforceTotalBytes().catch(() => {});
+  await pruneAlbum().catch(() => {});
+  return id;
+}
+
+async function ensureAlbumDir() {
+  await fsp.mkdir(ALBUM_DIR, { recursive: true });
+  if (!fs.existsSync(ALBUM_INDEX)) {
+    await fsp.writeFile(ALBUM_INDEX, '[]', 'utf8');
+  }
+}
+
+async function readAlbumIndex() {
+  await ensureAlbumDir();
+  try {
+    const text = await fsp.readFile(ALBUM_INDEX, 'utf8');
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeAlbumIndex(entries) {
+  await fsp.writeFile(ALBUM_INDEX, JSON.stringify(entries, null, 2));
+}
+
+function makeAssetId() {
+  const stamp = Date.now().toString(36);
+  const rand = Math.random().toString(36).slice(2, 10);
+  return `${stamp}-${rand}`;
+}
+
+function extForMime(mime) {
+  if (mime === 'image/png') return 'png';
+  if (mime === 'image/jpeg') return 'jpg';
+  if (mime === 'image/webp') return 'webp';
+  if (mime === 'video/mp4') return 'mp4';
+  return 'bin';
+}
+
+async function pruneAlbum() {
+  let entries = await readAlbumIndex();
+  if (entries.length <= MAX_ALBUM_ENTRIES) return;
+  // Drop the oldest until we're under the cap
+  entries = entries.sort((a, b) => a.createdAt - b.createdAt);
+  while (entries.length > MAX_ALBUM_ENTRIES) {
+    const dropped = entries.shift();
+    try { await fsp.unlink(path.join(ALBUM_DIR, `${dropped.id}.${dropped.ext}`)); }
+    catch { /* file may already be gone */ }
+  }
+  await writeAlbumIndex(entries);
+}
+
+async function enforceTotalBytes() {
+  let entries = await readAlbumIndex();
+  if (!entries.length) return;
+  let total = entries.reduce((sum, e) => sum + (e.bytes || 0), 0);
+  if (total <= ALBUM_TOTAL_BYTES) return;
+  // Drop the oldest until we're under the cap
+  entries = entries.sort((a, b) => a.createdAt - b.createdAt);
+  while (entries.length && total > ALBUM_TOTAL_BYTES) {
+    const dropped = entries.shift();
+    try {
+      await fsp.unlink(path.join(ALBUM_DIR, `${dropped.id}.${dropped.ext}`));
+      total -= dropped.bytes || 0;
+    } catch { /* swallow */ }
+  }
+  await writeAlbumIndex(entries);
+}
+
+app.get('/album', async (_req, res, next) => {
+  try {
+    const entries = await readAlbumIndex();
+    // Newest first
+    const sorted = entries.sort((a, b) => b.createdAt - a.createdAt);
+    res.json({
+      ok: true,
+      count: sorted.length,
+      total_bytes: sorted.reduce((sum, e) => sum + (e.bytes || 0), 0),
+      cap_bytes: ALBUM_TOTAL_BYTES,
+      cap_entries: MAX_ALBUM_ENTRIES,
+      items: sorted.map((e) => ({
+        id: e.id,
+        kind: e.kind,
+        prompt: e.prompt || null,
+        title: e.title || null,
+        mime: e.mime,
+        bytes: e.bytes,
+        provider: e.provider || null,
+        scene_n: typeof e.scene_n === 'number' ? e.scene_n : null,
+        width: e.width || null,
+        height: e.height || null,
+        created_at: new Date(e.createdAt).toISOString(),
+        url: `/album/${e.id}`,
+      })),
+    });
+  } catch (error) { next(error); }
+});
+
+app.post('/album/upload', async (req, res, next) => {
+  try {
+    await ensureAlbumDir();
+    const kind = String(req.query.kind || '').trim();
+    if (!['image', 'video'].includes(kind)) {
+      return res.status(422).json(errorBody('validation_error', 'kind must be "image" or "video"', false));
+    }
+    const mime = String(req.headers['content-type'] || '').split(';')[0].trim();
+    if (!mime.startsWith('image/') && !mime.startsWith('video/')) {
+      return res.status(422).json(errorBody('validation_error', 'Content-Type must be image/* or video/*', false));
+    }
+    const bytes = req.body;
+    if (!Buffer.isBuffer(bytes) || bytes.length === 0) {
+      return res.status(422).json(errorBody('validation_error', 'Empty request body', false));
+    }
+    if (bytes.length > 50 * 1024 * 1024) {
+      return res.status(413).json(errorBody('too_large', 'Asset exceeds 50 MB.', false));
+    }
+    const id = makeAssetId();
+    const ext = extForMime(mime);
+    const filePath = path.join(ALBUM_DIR, `${id}.${ext}`);
+    await fsp.writeFile(filePath, bytes);
+
+    // Extract metadata (best-effort — video is expensive, image is cheap)
+    let width = null;
+    let height = null;
+    let probe = null;
+    if (kind === 'image') {
+      try {
+        probe = await sharp(bytes).metadata();
+        width = probe.width || null;
+        height = probe.height || null;
+      } catch { /* ignore */ }
+    }
+
+    const meta = {
+      id,
+      kind,
+      mime,
+      ext,
+      bytes: bytes.length,
+      prompt: String(req.query.prompt || '').slice(0, 1000) || null,
+      title: String(req.query.title || '').slice(0, 200) || null,
+      provider: String(req.query.provider || '').trim() || null,
+      scene_n: req.query.scene_n != null ? Number(req.query.scene_n) : null,
+      width,
+      height,
+      createdAt: Date.now(),
+    };
+    const entries = await readAlbumIndex();
+    entries.push(meta);
+    await writeAlbumIndex(entries);
+    await enforceTotalBytes();
+    await pruneAlbum();
+    res.json({ ok: true, id, url: `/album/${id}`, bytes: meta.bytes, kind, mime, width, height });
+  } catch (error) { next(error); }
+});
+
+app.get('/album/:id', async (req, res, next) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!/^[a-z0-9-]+$/i.test(id)) {
+      return res.status(422).json(errorBody('validation_error', 'Invalid asset id', false));
+    }
+    const entries = await readAlbumIndex();
+    const entry = entries.find((e) => e.id === id);
+    if (!entry) return res.status(404).json(errorBody('not_found', 'Asset not found', false));
+    const filePath = path.join(ALBUM_DIR, `${entry.id}.${entry.ext}`);
+    if (!fs.existsSync(filePath)) {
+      return res.status(410).json(errorBody('gone', 'Asset file is missing from disk', false));
+    }
+    // Allow range requests for video scrubbing
+    const stat = await fsp.stat(filePath);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Content-Type', entry.mime);
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    const range = req.headers.range;
+    if (range) {
+      const match = /^bytes=(\d+)-(\d+)?$/.exec(range);
+      if (match) {
+        const start = Number(match[1]);
+        const end = match[2] ? Number(match[2]) : Math.min(start + 1024 * 1024 - 1, stat.size - 1);
+        if (start >= stat.size) {
+          res.setHeader('Content-Range', `bytes */${stat.size}`);
+          return res.status(416).end();
+        }
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${stat.size}`);
+        res.setHeader('Content-Length', end - start + 1);
+        return fs.createReadStream(filePath, { start, end }).pipe(res);
+      }
+    }
+    res.setHeader('Content-Length', stat.size);
+    fs.createReadStream(filePath).pipe(res);
+  } catch (error) { next(error); }
+});
+
+app.delete('/album/:id', async (req, res, next) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!/^[a-z0-9-]+$/i.test(id)) {
+      return res.status(422).json(errorBody('validation_error', 'Invalid asset id', false));
+    }
+    let entries = await readAlbumIndex();
+    const entry = entries.find((e) => e.id === id);
+    if (!entry) return res.status(404).json(errorBody('not_found', 'Asset not found', false));
+    try { await fsp.unlink(path.join(ALBUM_DIR, `${entry.id}.${entry.ext}`)); } catch { /* swallow */ }
+    entries = entries.filter((e) => e.id !== id);
+    await writeAlbumIndex(entries);
+    res.json({ ok: true, id });
+  } catch (error) { next(error); }
+});
+
+app.delete('/album', async (_req, res, next) => {
+  try {
+    await ensureAlbumDir();
+    const entries = await readAlbumIndex();
+    for (const entry of entries) {
+      try { await fsp.unlink(path.join(ALBUM_DIR, `${entry.id}.${entry.ext}`)); } catch { /* swallow */ }
+    }
+    await writeAlbumIndex([]);
+    res.json({ ok: true, deleted: entries.length });
+  } catch (error) { next(error); }
 });
 
 app.use((error, _req, res, _next) => {
