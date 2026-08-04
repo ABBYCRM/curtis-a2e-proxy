@@ -1,487 +1,438 @@
-/* ============================================================================
-   curtis-api-proxy — multi-provider CORS proxy + auth holder
-   ----------------------------------------------------------------------------
-   Forwards requests from the Trailer Studio browser front-end to:
-     • A2E.ai         (image + video gen, Free/Pro/Max plans)
-     • OpenAI         (Sora 2 / Sora 2 Pro, image gen, Vision)
-     • Google Gemini  (Veo 3, Imagen 3, text)
-   Holds each provider's key server-side via env vars so the browser never
-   sees them. Enforces CORS allowlist so random sites can't burn credits.
-   ============================================================================ */
+'use strict';
 
 const express = require('express');
 const cors = require('cors');
+const dns = require('dns').promises;
+const net = require('net');
 
 const app = express();
+const PORT = Number(process.env.PORT || 3000);
+const BUILD_SHA = process.env.RENDER_GIT_COMMIT || process.env.GIT_SHA || 'dev';
+const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 120000);
+const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES || 10 * 1024 * 1024);
+const APP_PROXY_TOKEN = (process.env.APP_PROXY_TOKEN || '').trim();
+const ALLOWED_ORIGINS = new Set(
+  (process.env.ALLOWED_ORIGINS ||
+    'https://curtis-image-gen.onrender.com,http://localhost:8080,http://127.0.0.1:8080')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean)
+);
 
-/* ---------- CORS allowlist ---------- */
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
-  'https://curtis-image-gen.onrender.com,http://localhost:8080,http://127.0.0.1:8080'
-).split(',').map(s => s.trim()).filter(Boolean);
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error(`CORS: origin ${origin} not allowed`));
-  }
-}));
-app.use(express.json({ limit: '20mb' }));
-
-/* ---------- Provider registry ---------- */
 const PROVIDERS = {
   a2e: {
-    label: 'A2E.ai',
     base: process.env.A2E_BASE_URL || 'https://video.a2e.ai',
-    getKey: () => process.env.A2E_API_KEY,
+    envKey: () => (process.env.A2E_API_KEY || '').trim(),
+    requestHeader: 'x-a2e-key',
   },
   openai: {
-    label: 'OpenAI',
     base: process.env.OPENAI_BASE_URL || 'https://api.openai.com',
-    getKey: () => process.env.OPENAI_API_KEY,
-  },
-  gemini: {
-    label: 'Google Gemini',
-    base: process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com',
-    getKey: () => process.env.GEMINI_API_KEY,
+    envKey: () => (process.env.OPENAI_API_KEY || '').trim(),
+    requestHeader: 'x-openai-key',
   },
 };
 
-/* ---------- Key resolution ----------
-   The user can paste their key in the app's Settings tab and the front-end
-   sends it on every request via:
-     x-a2e-key:    ...
-     x-openai-key: ...
-     x-gemini-key: ...
-   The proxy prefers the per-request key over the env var, so the operator
-   doesn't need to re-deploy just to add a key. The env var is still used
-   if the request doesn't include a header (back-compat with the operator's
-   own testing).
-   -------------------------------------------------------------------------- */
-function resolveKey(providerName, req){
-  const headerMap = {
-    a2e:    'x-a2e-key',
-    openai: 'x-openai-key',
-    gemini: 'x-gemini-key',
-  };
-  const h = headerMap[providerName];
-  const fromHeader = h ? (req.headers[h] || '').toString().trim() : '';
-  if(fromHeader) return { key: fromHeader, source: 'header' };
-  const fromEnv = PROVIDERS[providerName]?.getKey?.() || '';
-  if(fromEnv)     return { key: fromEnv, source: 'env' };
-  return { key: '', source: 'none' };
-}
-function keyErr(providerName){
-  const label = PROVIDERS[providerName]?.label || providerName;
-  return {
-    error: { message: `${providerName.toUpperCase()}_API_KEY not set (env or request header)` },
-    friendly: `${label} key is missing. Either paste it in the app's Settings tab, or set the env var on the proxy.`,
-    retryable: false,
-  };
-}
-
-/* ---------- Health + info ---------- */
-app.get('/', (_req, res) => res.json({
-  name: 'curtis-api-proxy',
-  providers: Object.fromEntries(
-    Object.entries(PROVIDERS).map(([k, p]) => [k, { label: p.label, ready: !!p.getKey() }])
-  ),
-  routes: {
-    a2e:    ['POST /a2e  body:{action, ...}'],
-    openai: ['POST /openai/videos', 'GET  /openai/videos/:id', 'GET  /openai/videos/:id/content', 'GET  /openai/usage'],
-    gemini: ['POST /gemini/videos',  'GET  /gemini/videos/:id'],
+app.disable('x-powered-by');
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Build-Sha', BUILD_SHA);
+  next();
+});
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin) return callback(null, false);
+    if (ALLOWED_ORIGINS.has(origin)) return callback(null, true);
+    return callback(new Error(`Origin not allowed: ${origin}`));
   },
-  notes: {
-    sora_deprecation: 'Sora 2 / Sora 2 Pro shut down 2026-09-24. Plan migration to Sora 3 or a successor before that date.',
-  }
+  allowedHeaders: ['content-type', 'x-a2e-key', 'x-openai-key', 'x-app-token'],
+  methods: ['GET', 'POST', 'OPTIONS'],
+  maxAge: 600,
 }));
+app.use(express.json({ limit: '12mb' }));
 
-app.get('/healthz', (_req, res) => res.json({
-  ok: Object.values(PROVIDERS).some(p => !!p.getKey()),
-  providers: Object.fromEntries(Object.entries(PROVIDERS).map(([k, p]) => [k, !!p.getKey()])),
-}));
-
-/* ============================================================================
-   A2E  (unchanged from prior version)
-   ============================================================================ */
-app.post('/a2e', async (req, res) => {
-  const { action } = req.body || {};
-  if (!action) return res.status(400).json({ code: -1, message: 'Missing action' });
-  const { key: KEY } = resolveKey('a2e', req);
-  if (!KEY) return res.status(500).json({ code: -1, ...keyErr('a2e') });
-  try {
-    switch (action) {
-      case 'image_start': {
-        const r = await fetch(`${PROVIDERS.a2e.base}/api/v1/userNanoBanana/start`, {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${KEY}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: req.body.name || 'trailer-still',
-            prompt: req.body.prompt,
-            input_images: Array.isArray(req.body.input_images) ? req.body.input_images : [],
-            aspectRatio: req.body.aspectRatio || '16:9',
-            resolution: req.body.resolution || '2K',
-          }),
-        });
-        return forwardJson(r, res);
-      }
-      case 'image_status': {
-        if (!req.body.id) return res.status(400).json({ code: -1, message: 'id required' });
-        const r = await fetch(`${PROVIDERS.a2e.base}/api/v1/userNanoBanana/detail/${encodeURIComponent(req.body.id)}`, {
-          method: 'GET',
-          headers: { 'Authorization': `Bearer ${KEY}` },
-        });
-        return forwardJson(r, res);
-      }
-      case 'video_start': {
-        const r = await fetch(`${PROVIDERS.a2e.base}/api/v1/userImage2Video/start`, {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${KEY}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: req.body.name || 'trailer-clip',
-            image_url: req.body.image_url,
-            prompt: req.body.prompt,
-            negative_prompt: req.body.negative_prompt || 'six fingers, bad hands, lowres, low quality, deformed face, blurry',
-            aspectRatio: req.body.aspectRatio || '16:9',
-          }),
-        });
-        return forwardJson(r, res);
-      }
-      case 'video_status': {
-        if (!req.body.id) return res.status(400).json({ code: -1, message: 'id required' });
-        const r = await fetch(`${PROVIDERS.a2e.base}/api/v1/userImage2Video/${encodeURIComponent(req.body.id)}`, {
-          method: 'GET',
-          headers: { 'Authorization': `Bearer ${KEY}` },
-        });
-        return forwardJson(r, res);
-      }
-      default:
-        return res.status(400).json({ code: -1, message: `Unknown action: ${action}` });
+const buckets = new Map();
+function rateLimit(req, res, next) {
+  const now = Date.now();
+  const key = `${req.ip}:${Math.floor(now / 60000)}`;
+  const count = (buckets.get(key) || 0) + 1;
+  buckets.set(key, count);
+  if (buckets.size > 5000) {
+    for (const [bucketKey] of buckets) {
+      const minute = Number(bucketKey.split(':').pop());
+      if (minute < Math.floor(now / 60000) - 2) buckets.delete(bucketKey);
     }
-  } catch (e) {
-    console.error('[a2e]', e);
-    return res.status(500).json({ code: -1, message: e.message || 'a2e error' });
   }
-});
+  if (count > 60) {
+    return res.status(429).json(errorBody('rate_limited', 'Too many requests. Try again in a minute.', true));
+  }
+  next();
+}
+app.use(rateLimit);
 
-/* ============================================================================
-   A2E status poll
-   ----------------------------------------------------------------------------
-   The front-end's pollUntilDone() calls this in two ways:
-     - POST /a2e/status  body: { action: 'image_status'|'video_status', id }
-     - GET  /a2e/status?kind=image|video&id=XXX
-   Both forms route to the right A2E detail endpoint and return the result
-   wrapped in {code, data, friendly, retryable} so the front-end can read it
-   the same way it reads /a2e responses.
-   ============================================================================ */
-async function a2eStatusFetch(kind, id, req){
-  if(!id) return { code: -1, message: 'id required', friendly: 'Missing job id.', retryable: false };
-  // Prefer the per-request key (x-a2e-key header) so the user can paste
-  // their key in the app's Settings tab without needing to set the
-  // proxy's env var. Fall back to env for operator self-tests.
-  const { key: KEY } = resolveKey('a2e', req || { headers: {} });
-  if(!KEY) return { code: -1, ...keyErr('a2e') };
-  const path = kind === 'video'
-    ? `/api/v1/userImage2Video/${encodeURIComponent(id)}`
-    : `/api/v1/userNanoBanana/detail/${encodeURIComponent(id)}`;
-  let r;
-  try {
-    r = await fetch(`${PROVIDERS.a2e.base}${path}`, {
-      method: 'GET',
-      headers: { 'Authorization': `Bearer ${KEY}` },
-    });
-  } catch (e) {
-    console.error('[a2e/status]', e);
-    return { code: -1, message: e.message || 'a2e status fetch error', friendly: 'Could not reach the provider.', retryable: true };
-  }
-  // Normalize the response in the same way forwardJson does, but as a
-  // pure function that returns the JSON instead of writing to res.
-  const text = await r.text();
-  let j; try { j = JSON.parse(text); } catch { j = { raw: text }; }
-  const isA2EStructuredError = j && typeof j.code === 'number' && j.code !== 0;
-  const isUpstreamServerError = r.status >= 500;
-  if(isA2EStructuredError){
-    j.friendly = friendlyA2E(j);
-    j.retryable = false;
-  } else if(isUpstreamServerError){
-    j.friendly = 'The provider is having trouble. Try again in a minute.';
-    j.retryable = true;
-  } else if(!r.ok){
-    j.friendly = `Provider returned HTTP ${r.status}.`;
-    j.retryable = r.status >= 500;
-  }
-  return j;
+function errorBody(code, message, retryable = false, details) {
+  return {
+    error: { code, message },
+    friendly: message,
+    retryable,
+    ...(details ? { details } : {}),
+  };
 }
 
-function handleA2eStatus(req, res){
-  const kind = (req.body?.kind || req.query?.kind || '').toLowerCase();
-  const id   = (req.body?.id   || req.query?.id   || '').toString();
-  // The action may also tell us the kind: image_status → image, video_status → video
-  const action = (req.body?.action || '').toLowerCase();
-  const resolvedKind = kind || (action === 'video_status' ? 'video' : action === 'image_status' ? 'image' : '');
-  if(!resolvedKind){
-    return res.status(400).json({ code: -1, message: 'kind (image|video) or action (image_status|video_status) required', friendly: 'Specify kind=image or kind=video in the poll request.', retryable: false });
-  }
-  a2eStatusFetch(resolvedKind, id, req).then(j => res.json(j));
+function resolveKey(providerName, req) {
+  const provider = PROVIDERS[providerName];
+  if (!provider) return '';
+  const supplied = String(req.get(provider.requestHeader) || '').trim();
+  if (supplied) return supplied;
+  const appToken = String(req.get('x-app-token') || '').trim();
+  if (APP_PROXY_TOKEN && appToken === APP_PROXY_TOKEN) return provider.envKey();
+  return '';
 }
 
-app.post('/a2e/status', handleA2eStatus);
-app.get('/a2e/status',  handleA2eStatus);
+function requireKey(providerName, req, res) {
+  const key = resolveKey(providerName, req);
+  if (key) return key;
+  res.status(401).json(errorBody(
+    'missing_provider_key',
+    `A ${providerName === 'openai' ? 'OpenAI' : 'A2E'} API key is required. Paste it in Settings.`,
+    false
+  ));
+  return null;
+}
 
-/* ============================================================================
-   OpenAI
-   Sora 2 / Sora 2 Pro — create + poll + download
-   Docs: https://developers.openai.com/api/docs/guides/video-generation
-   Deprecation: 2026-09-24
-   ============================================================================ */
+function requiredString(value, field, maxLength = 12000) {
+  if (typeof value !== 'string' || !value.trim()) {
+    const error = new Error(`${field} is required`);
+    error.status = 422;
+    error.code = 'validation_error';
+    throw error;
+  }
+  if (value.length > maxLength) {
+    const error = new Error(`${field} is too long`);
+    error.status = 413;
+    error.code = 'validation_error';
+    throw error;
+  }
+  return value.trim();
+}
 
-// Create a video generation job
-app.post('/openai/videos', async (req, res) => {
-  const { key: KEY } = resolveKey('openai', req);
-  if (!KEY) return res.status(500).json(keyErr('openai'));
+function enumValue(value, allowed, fallback) {
+  return allowed.includes(value) ? value : fallback;
+}
+
+async function upstreamFetch(url, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   try {
-    const { model = 'sora-2', prompt, size = '1280x720', seconds = '4',
-            input_reference, /* base64 or url of reference image (face lock) */
-            reference_type = 'character' } = req.body || {};
-    if (!prompt) return res.status(400).json({ error: { message: 'prompt required' } });
-
-    // OpenAI v1/videos accepts input_reference as multipart form data per
-    // their curl example. Since we want to keep this a pure JSON proxy,
-    // we accept input_reference as a URL and pass it as `image_url` instead
-    // (Sora does accept this for i2v style requests where supported).
-    // If the caller wants strict character consistency, they should use
-    // /openai/videos/characters first to register a character.
-    const body = { model, prompt, size, seconds };
-    if (input_reference) {
-      // Sora 2 image-to-video: pass as input_reference field
-      body.input_reference = input_reference;
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      const timeoutError = new Error('The provider timed out. Try again.');
+      timeoutError.status = 504;
+      timeoutError.code = 'upstream_timeout';
+      timeoutError.retryable = true;
+      throw timeoutError;
     }
-    const r = await fetch(`${PROVIDERS.openai.base}/v1/videos`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    return forwardJson(r, res);
-  } catch (e) {
-    console.error('[openai create]', e);
-    return res.status(500).json({
-      error: { message: e.message },
-      friendly: 'OpenAI request failed. Check your network and try again.',
-      retryable: true,
-    });
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+async function readProviderJson(response, providerName) {
+  const text = await response.text();
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    body = { raw: text.slice(0, 1000) };
+  }
+
+  if (providerName === 'a2e' && typeof body.code === 'number' && body.code !== 0) {
+    const message = body.msg || body.message || 'A2E rejected the request.';
+    const lower = message.toLowerCase();
+    const retryable = lower.includes('rate') || lower.includes('busy') || lower.includes('timeout');
+    const error = new Error(message);
+    error.status = retryable ? 503 : 422;
+    error.code = 'a2e_error';
+    error.retryable = retryable;
+    error.providerBody = body;
+    throw error;
+  }
+
+  if (!response.ok) {
+    const providerMessage = body?.error?.message || body?.message || body?.msg || `Provider returned HTTP ${response.status}`;
+    const error = new Error(providerMessage);
+    error.status = response.status;
+    error.code = body?.error?.code || 'provider_error';
+    error.retryable = response.status === 429 || response.status >= 500;
+    error.providerBody = body;
+    throw error;
+  }
+  return body;
+}
+
+function parseDataUrl(value) {
+  const match = /^data:([^;,]+);base64,([A-Za-z0-9+/=\s]+)$/.exec(value || '');
+  if (!match) return null;
+  const bytes = Buffer.from(match[2].replace(/\s/g, ''), 'base64');
+  return { mime: match[1], bytes };
+}
+
+function isPrivateAddress(address) {
+  if (net.isIP(address) === 4) {
+    const parts = address.split('.').map(Number);
+    const [a, b] = parts;
+    return a === 0 || a === 10 || a === 127 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      a >= 224;
+  }
+  if (net.isIP(address) === 6) {
+    const normalized = address.toLowerCase();
+    if (normalized === '::' || normalized === '::1') return true;
+    if (normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe8') ||
+        normalized.startsWith('fe9') || normalized.startsWith('fea') || normalized.startsWith('feb')) return true;
+    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(normalized);
+    return mapped ? isPrivateAddress(mapped[1]) : false;
+  }
+  return true;
+}
+
+async function assertPublicHttpsUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw Object.assign(new Error('Reference must be a data URL or an HTTPS image URL.'), { status: 422 });
+  }
+  if (url.protocol !== 'https:') throw Object.assign(new Error('Only HTTPS reference URLs are allowed.'), { status: 422 });
+  if (url.username || url.password) throw Object.assign(new Error('Reference URLs cannot contain credentials.'), { status: 422 });
+  const hostname = url.hostname.toLowerCase();
+  if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local')) {
+    throw Object.assign(new Error('Private reference hosts are not allowed.'), { status: 422 });
+  }
+  const addresses = net.isIP(hostname)
+    ? [{ address: hostname }]
+    : await dns.lookup(hostname, { all: true, verbatim: true });
+  if (!addresses.length || addresses.some(({ address }) => isPrivateAddress(address))) {
+    throw Object.assign(new Error('Private reference hosts are not allowed.'), { status: 422 });
+  }
+  return url;
+}
+
+async function fetchPublicImage(value) {
+  let url = await assertPublicHttpsUrl(value);
+  for (let redirect = 0; redirect <= 3; redirect += 1) {
+    const response = await upstreamFetch(url, { redirect: 'manual' });
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get('location');
+      if (!location) throw Object.assign(new Error('Reference URL redirected without a destination.'), { status: 422 });
+      url = await assertPublicHttpsUrl(new URL(location, url).toString());
+      continue;
+    }
+    return response;
+  }
+  throw Object.assign(new Error('Reference URL redirected too many times.'), { status: 422 });
+}
+
+async function loadImageInput(input) {
+  const value = requiredString(input, 'input_reference', 16 * 1024 * 1024);
+  const data = parseDataUrl(value);
+  if (data) {
+    if (!data.mime.startsWith('image/')) throw Object.assign(new Error('Reference must be an image.'), { status: 422 });
+    if (data.bytes.length > MAX_IMAGE_BYTES) throw Object.assign(new Error('Reference image is too large.'), { status: 413 });
+    return data;
+  }
+
+  const response = await fetchPublicImage(value);
+  if (!response.ok) throw Object.assign(new Error(`Could not download the reference image (HTTP ${response.status}).`), { status: 422 });
+  const mime = (response.headers.get('content-type') || '').split(';')[0].trim();
+  if (!mime.startsWith('image/')) throw Object.assign(new Error('Reference URL did not return an image.'), { status: 422 });
+  const declaredLength = Number(response.headers.get('content-length') || 0);
+  if (declaredLength > MAX_IMAGE_BYTES) throw Object.assign(new Error('Reference image is too large.'), { status: 413 });
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.length > MAX_IMAGE_BYTES) throw Object.assign(new Error('Reference image is too large.'), { status: 413 });
+  return { mime, bytes };
+}
+
+function normalizeOpenAIImage(body) {
+  const first = body?.data?.[0];
+  if (!first) throw Object.assign(new Error('OpenAI returned no image.'), { status: 502, retryable: true });
+  if (first.url) return { image_url: first.url, revised_prompt: first.revised_prompt || null, usage: body.usage || null };
+  if (first.b64_json) {
+    return {
+      image_url: `data:image/png;base64,${first.b64_json}`,
+      revised_prompt: first.revised_prompt || null,
+      usage: body.usage || null,
+    };
+  }
+  throw Object.assign(new Error('OpenAI returned an unsupported image response.'), { status: 502, retryable: true });
+}
+
+app.get('/', (_req, res) => {
+  res.json({
+    name: 'curtis-api-proxy',
+    version: 2,
+    build: BUILD_SHA,
+    capabilities: {
+      openai_images: true,
+      openai_reference_edit: true,
+      openai_video: false,
+      a2e_images: true,
+      a2e_video: true,
+      gemini: false,
+    },
+    authentication: {
+      request_keys: true,
+      protected_env_keys: Boolean(APP_PROXY_TOKEN),
+    },
+  });
 });
 
-// Poll a video job
-app.get('/openai/videos/:id', async (req, res) => {
-  const { key: KEY } = resolveKey('openai', req);
-  if (!KEY) return res.status(500).json(keyErr('openai'));
-  try {
-    const r = await fetch(`${PROVIDERS.openai.base}/v1/videos/${encodeURIComponent(req.params.id)}`, {
-      headers: { 'Authorization': `Bearer ${KEY}` },
-    });
-    return forwardJson(r, res);
-  } catch (e) {
-    return res.status(500).json({ error: { message: e.message } });
-  }
+app.get('/healthz', (_req, res) => {
+  res.json({ ok: true, build: BUILD_SHA, version: 2 });
 });
 
-// Download the finished MP4 (proxy streams it through so CORS works)
-app.get('/openai/videos/:id/content', async (req, res) => {
-  const { key: KEY } = resolveKey('openai', req);
-  if (!KEY) return res.status(500).json(keyErr('openai'));
+app.post('/openai/images', async (req, res, next) => {
+  const key = requireKey('openai', req, res);
+  if (!key) return;
   try {
-    const variant = req.query.variant || 'mp4';
-    const r = await fetch(`${PROVIDERS.openai.base}/v1/videos/${encodeURIComponent(req.params.id)}/content?variant=${variant}`, {
-      headers: { 'Authorization': `Bearer ${KEY}` },
-    });
-    if (!r.ok) {
-      const text = await r.text();
-      let j; try { j = JSON.parse(text); } catch { j = { raw: text }; }
-      return res.status(r.status).json({
-        ...j,
-        friendly: friendlyOpenAI(j),
-        retryable: r.status >= 500,
+    const prompt = requiredString(req.body?.prompt, 'prompt');
+    const model = 'gpt-image-2';
+    const size = enumValue(req.body?.size, ['1024x1024', '1024x1536', '1536x1024'], '1536x1024');
+    const quality = enumValue(req.body?.quality, ['low', 'medium', 'high', 'auto'], 'medium');
+    const reference = typeof req.body?.input_reference === 'string' && req.body.input_reference.trim()
+      ? req.body.input_reference.trim()
+      : null;
+
+    let response;
+    if (reference) {
+      const image = await loadImageInput(reference);
+      const form = new FormData();
+      form.append('model', model);
+      form.append('prompt', prompt);
+      form.append('size', size);
+      form.append('quality', quality);
+      form.append('image', new Blob([image.bytes], { type: image.mime }), `reference.${image.mime.split('/')[1] || 'png'}`);
+      response = await upstreamFetch(`${PROVIDERS.openai.base}/v1/images/edits`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}` },
+        body: form,
+      });
+    } else {
+      response = await upstreamFetch(`${PROVIDERS.openai.base}/v1/images/generations`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, prompt, size, quality, n: 1 }),
       });
     }
-    res.setHeader('Content-Type', r.headers.get('content-type') || 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename="openai-${req.params.id}.${variant}"`);
-    const buf = Buffer.from(await r.arrayBuffer());
-    res.send(buf);
-  } catch (e) {
-    return res.status(500).json({ error: { message: e.message } });
+    const body = await readProviderJson(response, 'openai');
+    res.json({ ok: true, model, ...normalizeOpenAIImage(body) });
+  } catch (error) {
+    next(error);
   }
 });
 
-// OpenAI image generation (gpt-image-1 / dall-e-3) for the trailer stills.
-// The front-end's OpenAI provider uses this to make one still per scene
-// (face-locked via input_reference for dall-e-3 edits, or just prompt for
-// gpt-image-1).
-app.post('/openai/images', async (req, res) => {
-  const { key: KEY } = resolveKey('openai', req);
-  if (!KEY) return res.status(500).json(keyErr('openai'));
-  try {
-    const {
-      prompt,
-      model = 'gpt-image-1',
-      size = '1024x1024',
-      n = 1,
-      input_reference,  // optional base64 or URL of reference image (face lock)
-    } = req.body || {};
-    if (!prompt) return res.status(400).json({ error: { message: 'prompt required' } });
-    const body = { model, prompt, size, n };
-    if (input_reference) body.input_reference = input_reference;
-    const r = await fetch(`${PROVIDERS.openai.base}/v1/images/generations`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+app.all('/openai/videos*', (_req, res) => {
+  res.status(410).json(errorBody(
+    'openai_video_disabled',
+    'OpenAI video generation is disabled because the configured Sora models are deprecated. Use A2E for clips.',
+    false
+  ));
+});
+
+async function a2eRequest(key, action, payload) {
+  const headers = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' };
+  let url;
+  let method = 'POST';
+  let body;
+  if (action === 'image_start') {
+    url = `${PROVIDERS.a2e.base}/api/v1/userNanoBanana/start`;
+    body = JSON.stringify({
+      name: payload.name || `curtis-image-${Date.now()}`,
+      prompt: requiredString(payload.prompt, 'prompt'),
+      input_images: Array.isArray(payload.input_images) ? payload.input_images.slice(0, 1) : [],
+      aspectRatio: enumValue(payload.aspectRatio, ['16:9', '9:16', '1:1', '4:5'], '16:9'),
+      resolution: enumValue(payload.resolution, ['1K', '2K', '4K'], '2K'),
     });
-    return forwardJson(r, res);
-  } catch (e) {
-    console.error('[openai images]', e);
-    return res.status(500).json({
-      error: { message: e.message },
-      friendly: 'OpenAI image request failed. Check your network and try again.',
-      retryable: true,
+  } else if (action === 'video_start') {
+    url = `${PROVIDERS.a2e.base}/api/v1/userImage2Video/start`;
+    body = JSON.stringify({
+      name: payload.name || `curtis-video-${Date.now()}`,
+      image_url: requiredString(payload.image_url, 'image_url', 16 * 1024 * 1024),
+      prompt: requiredString(payload.prompt, 'prompt'),
+      negative_prompt: String(payload.negative_prompt || 'deformed face, blurry, low quality').slice(0, 2000),
+      aspectRatio: enumValue(payload.aspectRatio, ['16:9', '9:16', '1:1', '4:5'], '16:9'),
     });
+  } else if (action === 'image_status') {
+    const id = encodeURIComponent(requiredString(payload.id, 'id', 256));
+    url = `${PROVIDERS.a2e.base}/api/v1/userNanoBanana/detail/${id}`;
+    method = 'GET';
+    body = undefined;
+  } else if (action === 'video_status') {
+    const id = encodeURIComponent(requiredString(payload.id, 'id', 256));
+    url = `${PROVIDERS.a2e.base}/api/v1/userImage2Video/${id}`;
+    method = 'GET';
+    body = undefined;
+  } else {
+    throw Object.assign(new Error('Unknown A2E action.'), { status: 422, code: 'validation_error' });
   }
-});
-
-// OpenAI usage — for the spend cap guard
-app.get('/openai/usage', async (req, res) => {
-  const { key: KEY } = resolveKey('openai', req);
-  if (!KEY) return res.status(500).json(keyErr('openai'));
-  try {
-    // OpenAI's usage endpoint requires admin scope for org-wide, but
-    // account-level usage is at /v1/usage with date range query.
-    // This is a best-effort fetch; if the key doesn't have usage scope,
-    // we return what we can.
-    const now = new Date();
-    const yyyy = now.toISOString().slice(0,10);
-    const r = await fetch(`${PROVIDERS.openai.base}/v1/usage?date=${yyyy}`, {
-      headers: { 'Authorization': `Bearer ${KEY}` },
-    });
-    return forwardJson(r, res);
-  } catch (e) {
-    return res.status(500).json({ error: { message: e.message } });
-  }
-});
-
-/* ============================================================================
-   Gemini / Veo
-   Docs: https://ai.google.dev/gemini-api/docs/video
-   Shape: long-running predictLongRunning operation, poll until done.
-   ============================================================================ */
-app.post('/gemini/videos', async (req, res) => {
-  const { key: KEY } = resolveKey('gemini', req);
-  if (!KEY) return res.status(500).json(keyErr('gemini'));
-  try {
-    const { model = 'veo-3.1-generate-preview', prompt, image_url, aspect_ratio = '16:9' } = req.body || {};
-    if (!prompt) return res.status(400).json({ error: { message: 'prompt required' } });
-    // Veo uses predictLongRunning under :predictLongRunning endpoint
-    const r = await fetch(
-      `${PROVIDERS.gemini.base}/v1beta/models/${encodeURIComponent(model)}:predictLongRunning?key=${KEY}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          instances: [{
-            prompt,
-            image: image_url ? { bytesBase64Encoded: '', gcsUri: '', mimeType: 'image/jpeg' } : undefined,
-          }],
-          parameters: { aspectRatio: aspect_ratio, sampleCount: 1, personGeneration: 'dont_allow' },
-        }),
-      }
-    );
-    return forwardJson(r, res);
-  } catch (e) {
-    console.error('[gemini create]', e);
-    return res.status(500).json({ error: { message: e.message } });
-  }
-});
-
-app.get('/gemini/videos/:op', async (req, res) => {
-  const { key: KEY } = resolveKey('gemini', req);
-  if (!KEY) return res.status(500).json(keyErr('gemini'));
-  try {
-    const r = await fetch(
-      `${PROVIDERS.gemini.base}/v1beta/${decodeURIComponent(req.params.op)}?key=${KEY}`
-    );
-    return forwardJson(r, res);
-  } catch (e) {
-    return res.status(500).json({ error: { message: e.message } });
-  }
-});
-
-/* ---------- helpers ---------- */
-async function forwardJson(r, res) {
-  const text = await r.text();
-  let j; try { j = JSON.parse(text); } catch { j = { raw: text }; }
-  // Normalize: A2E returns structured business errors as
-  // {code: <nonzero>, msg, trace_id}. Forward them as HTTP 200 so the
-  // front-end can read the structured error. Only pass through non-2xx
-  // when the response is not parseable JSON or the upstream itself
-  // returned a 5xx (real failure, not a business rejection).
-  const isA2EStructuredError = j && typeof j.code === 'number' && j.code !== 0;
-  const isUpstreamServerError = r.status >= 500;
-  const status = (!r.ok && !isA2EStructuredError) || isUpstreamServerError
-    ? r.status
-    : 200;
-
-  // Tag the error so the front-end knows whether to retry, surface a
-  // friendly message, or block the run entirely.
-  if(isA2EStructuredError){
-    j.friendly = friendlyA2E(j);
-    j.retryable = false;  // structured business errors don't get better on retry
-  } else if(isUpstreamServerError){
-    j.friendly = 'The provider is having trouble. Try again in a minute.';
-    j.retryable = true;
-  } else if(!r.ok){
-    j.friendly = `Provider returned HTTP ${r.status}.`;
-    j.retryable = r.status >= 500;
-  }
-  return res.status(status).json(j);
+  const response = await upstreamFetch(url, { method, headers, body });
+  return readProviderJson(response, 'a2e');
 }
 
-function friendlyA2E(j){
-  const msg = (j.msg || j.message || '').toLowerCase();
-  if(msg.includes('free user') || msg.includes('pro or max')){
-    return 'Your A2E account is on the Free plan. The API requires Pro or Max. Upgrade at video.a2e.ai → Account → Plan.';
+app.post('/a2e', async (req, res, next) => {
+  const key = requireKey('a2e', req, res);
+  if (!key) return;
+  try {
+    const action = requiredString(req.body?.action, 'action', 64);
+    const result = await a2eRequest(key, action, req.body || {});
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    next(error);
   }
-  if(msg.includes('unauthorized') || msg.includes('401') || msg.includes('invalid token')){
-    return 'The A2E API key is wrong or expired. Generate a new one in the A2E dashboard and paste it in Settings.';
-  }
-  if(msg.includes('quota') || msg.includes('insufficient')){
-    return 'You\'ve run out of A2E credits. Top up at video.a2e.ai.';
-  }
-  if(msg.includes('rate limit') || msg.includes('too many')){
-    return 'A2E is rate-limiting you. Wait a minute and try again.';
-  }
-  return j.msg || j.message || 'A2E returned an error.';
-}
+});
 
-function friendlyOpenAI(j){
-  const code = j?.error?.code;
-  const msg = (j?.error?.message || '').toLowerCase();
-  if(code === 'invalid_api_key' || msg.includes('incorrect api key') || msg.includes('invalid api key')){
-    return 'The OpenAI key is wrong or revoked. Generate a new one at platform.openai.com → API keys, then paste it in Settings.';
+app.get('/a2e/status', async (req, res, next) => {
+  const key = requireKey('a2e', req, res);
+  if (!key) return;
+  try {
+    const kind = enumValue(req.query.kind, ['image', 'video'], '');
+    if (!kind) throw Object.assign(new Error('kind must be image or video'), { status: 422 });
+    const result = await a2eRequest(key, `${kind}_status`, { id: req.query.id });
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    next(error);
   }
-  if(msg.includes('insufficient_quota') || msg.includes('billing') || msg.includes('payment')){
-    return 'OpenAI says you\'re out of credit. Add a payment method at platform.openai.com → Billing.';
-  }
-  if(msg.includes('sora') && (msg.includes('deprecat') || msg.includes('shutdown'))){
-    return 'Sora 2 is shutting down on 2026-09-24. The proxy doesn\'t have access to the successor model yet. Use A2E for now.';
-  }
-  if(msg.includes('rate_limit') || msg.includes('too many requests')){
-    return 'OpenAI is rate-limiting you. Wait a minute and try again.';
-  }
-  if(msg.includes('content_policy') || msg.includes('safety') || msg.includes('rejected')){
-    return 'OpenAI rejected the prompt as unsafe. Try rewording the script.';
-  }
-  if(msg.includes('model') && msg.includes('not found')){
-    return 'The selected OpenAI model doesn\'t exist or you don\'t have access. Try sora-2 (the cheaper one).';
-  }
-  return j?.error?.message || 'OpenAI returned an error.';
-}
+});
 
-/* ---------- listen ---------- */
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`[curtis-api-proxy] listening on :${port}`));
+app.post('/a2e/status', async (req, res, next) => {
+  const key = requireKey('a2e', req, res);
+  if (!key) return;
+  try {
+    const action = req.body?.action || (req.body?.kind ? `${req.body.kind}_status` : '');
+    const result = await a2eRequest(key, requiredString(action, 'action', 64), { id: req.body?.id });
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.use((error, _req, res, _next) => {
+  console.error('[proxy]', error.code || error.name, error.message);
+  const status = Number(error.status || 500);
+  const retryable = Boolean(error.retryable || status === 429 || status >= 500);
+  const safeMessage = status >= 500 && !error.retryable
+    ? 'The proxy encountered an unexpected error.'
+    : error.message;
+  res.status(status).json(errorBody(error.code || 'proxy_error', safeMessage, retryable));
+});
+
+app.listen(PORT, () => {
+  console.log(`[curtis-api-proxy] listening on :${PORT} build=${BUILD_SHA}`);
+});

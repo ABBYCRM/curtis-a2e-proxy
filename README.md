@@ -1,45 +1,42 @@
-# curtis-a2e-proxy
+# Curtis API Proxy
 
-Tiny CORS proxy + auth holder for the A2E.ai API, used by [Curtis Image Gen](https://github.com/ABBYCRM/Curtis-Image-Gen).
+A constrained provider proxy for Curtis Image Studio.
 
-## Why
+## Routes
 
-The browser cannot call `video.a2e.ai` directly (CORS). This service:
-1. Holds the A2E Bearer token in `A2E_API_KEY` (server-side only, never sent to the browser).
-2. Accepts JSON `{action, ...}` from the Trailer Studio frontend.
-3. Forwards to the real A2E endpoint with the correct auth header.
-4. Returns the A2E response untouched.
+- `GET /healthz` — deployment health and API version
+- `POST /openai/images` — GPT Image 2 generation or reference-image editing
+- `POST /a2e` — A2E image/video submit actions
+- `GET|POST /a2e/status` — A2E polling
 
-## Endpoints
+OpenAI video routes return `410 Gone`. The old Sora integration was deprecated and used an invalid reference-image request format.
 
-- `GET  /`            — service info
-- `GET  /healthz`     — `{ok: <bool>}`
-- `POST /a2e`         — body: `{action, ...}`
+## Authentication
 
-### Supported actions
+Users may supply provider keys per request:
 
-| action | A2E upstream | body |
-|---|---|---|
-| `image_start` | `POST /api/v1/userNanoBanana/start` | `{name, prompt, input_images[], aspectRatio, resolution}` |
-| `image_status` | `POST /api/v1/userNanoBanana/detail/{id}` | `{id}` |
-| `video_start` | `POST /api/v1/userImage2Video/start` | `{name, image_url, prompt, negative_prompt, aspectRatio}` |
-| `video_status` | `GET /api/v1/userImage2Video/{id}` | `{id}` |
+- `x-openai-key`
+- `x-a2e-key`
 
-## Environment
+Environment keys are optional and protected. To allow the proxy to use `OPENAI_API_KEY` or `A2E_API_KEY`, configure `APP_PROXY_TOKEN` and send the same value in `x-app-token`. Without that token, environment keys are never used.
 
-| Var | Required | Default |
-|---|---|---|
-| `A2E_API_KEY` | yes | — |
-| `A2E_BASE_URL` | no | `https://video.a2e.ai` |
-| `PORT` | no | `3000` |
+## Environment variables
 
-## Local run
+| Variable | Purpose |
+|---|---|
+| `ALLOWED_ORIGINS` | Comma-separated browser origins |
+| `APP_PROXY_TOKEN` | Protects environment-held provider keys |
+| `OPENAI_API_KEY` | Optional protected OpenAI key |
+| `A2E_API_KEY` | Optional protected A2E key |
+| `OPENAI_BASE_URL` | Defaults to `https://api.openai.com` |
+| `A2E_BASE_URL` | Defaults to `https://video.a2e.ai` |
+| `UPSTREAM_TIMEOUT_MS` | Provider timeout, default 120 seconds |
+| `MAX_IMAGE_BYTES` | Maximum reference image size, default 10 MB |
+| `PORT` | HTTP port, default 3000 |
+
+## Run
 
 ```bash
-npm install
-A2E_API_KEY=sk_xxx npm start
+npm ci
+npm start
 ```
-
-## Deploy
-
-Deployed to Render as a Node Web Service. Build command: `npm install`. Start command: `npm start`.
