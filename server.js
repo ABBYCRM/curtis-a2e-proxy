@@ -850,6 +850,11 @@ app.get('/album/:id', async (req, res, next) => {
     // browser cache for a year.
     res.setHeader('Vary', 'Origin');
     res.setHeader('Cache-Control', 'public, max-age=300');
+    // Content-Disposition: attachment makes the browser save the file
+    // instead of navigating to it. We use the same filename scheme the
+    // Album UI generates (kind-id.ext) so the user's saved file has a
+    // sensible name.
+    res.setHeader('Content-Disposition', `attachment; filename="${entry.kind}-${entry.id}.${entry.ext}"`);
     const range = req.headers.range;
     if (range) {
       const match = /^bytes=(\d+)-(\d+)?$/.exec(range);
