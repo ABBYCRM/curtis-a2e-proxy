@@ -311,6 +311,40 @@ app.get('/openai/videos/:id/content', async (req, res) => {
   }
 });
 
+// OpenAI image generation (gpt-image-1 / dall-e-3) for the trailer stills.
+// The front-end's OpenAI provider uses this to make one still per scene
+// (face-locked via input_reference for dall-e-3 edits, or just prompt for
+// gpt-image-1).
+app.post('/openai/images', async (req, res) => {
+  const { key: KEY } = resolveKey('openai', req);
+  if (!KEY) return res.status(500).json(keyErr('openai'));
+  try {
+    const {
+      prompt,
+      model = 'gpt-image-1',
+      size = '1024x1024',
+      n = 1,
+      input_reference,  // optional base64 or URL of reference image (face lock)
+    } = req.body || {};
+    if (!prompt) return res.status(400).json({ error: { message: 'prompt required' } });
+    const body = { model, prompt, size, n };
+    if (input_reference) body.input_reference = input_reference;
+    const r = await fetch(`${PROVIDERS.openai.base}/v1/images/generations`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return forwardJson(r, res);
+  } catch (e) {
+    console.error('[openai images]', e);
+    return res.status(500).json({
+      error: { message: e.message },
+      friendly: 'OpenAI image request failed. Check your network and try again.',
+      retryable: true,
+    });
+  }
+});
+
 // OpenAI usage — for the spend cap guard
 app.get('/openai/usage', async (req, res) => {
   const { key: KEY } = resolveKey('openai', req);
