@@ -70,10 +70,10 @@ app.get('/healthz', (_req, res) => res.json({
    A2E  (unchanged from prior version)
    ============================================================================ */
 app.post('/a2e', async (req, res) => {
-  const KEY = PROVIDERS.a2e.getKey();
-  if (!KEY) return res.status(500).json({ code: -1, message: 'A2E_API_KEY not configured' });
   const { action } = req.body || {};
   if (!action) return res.status(400).json({ code: -1, message: 'Missing action' });
+  const KEY = PROVIDERS.a2e.getKey();
+  if (!KEY) return res.status(500).json({ code: -1, message: 'A2E_API_KEY not configured' });
   try {
     switch (action) {
       case 'image_start': {
@@ -128,6 +128,67 @@ app.post('/a2e', async (req, res) => {
     return res.status(500).json({ code: -1, message: e.message || 'a2e error' });
   }
 });
+
+/* ============================================================================
+   A2E status poll
+   ----------------------------------------------------------------------------
+   The front-end's pollUntilDone() calls this in two ways:
+     - POST /a2e/status  body: { action: 'image_status'|'video_status', id }
+     - GET  /a2e/status?kind=image|video&id=XXX
+   Both forms route to the right A2E detail endpoint and return the result
+   wrapped in {code, data, friendly, retryable} so the front-end can read it
+   the same way it reads /a2e responses.
+   ============================================================================ */
+async function a2eStatusFetch(kind, id){
+  if(!id) return { code: -1, message: 'id required', friendly: 'Missing job id.', retryable: false };
+  const KEY = PROVIDERS.a2e.getKey();
+  if(!KEY) return { code: -1, message: 'A2E_API_KEY not configured', friendly: 'A2E key missing on the proxy.', retryable: false };
+  const path = kind === 'video'
+    ? `/api/v1/userImage2Video/${encodeURIComponent(id)}`
+    : `/api/v1/userNanoBanana/detail/${encodeURIComponent(id)}`;
+  let r;
+  try {
+    r = await fetch(`${PROVIDERS.a2e.base}${path}`, {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${KEY}` },
+    });
+  } catch (e) {
+    console.error('[a2e/status]', e);
+    return { code: -1, message: e.message || 'a2e status fetch error', friendly: 'Could not reach the provider.', retryable: true };
+  }
+  // Normalize the response in the same way forwardJson does, but as a
+  // pure function that returns the JSON instead of writing to res.
+  const text = await r.text();
+  let j; try { j = JSON.parse(text); } catch { j = { raw: text }; }
+  const isA2EStructuredError = j && typeof j.code === 'number' && j.code !== 0;
+  const isUpstreamServerError = r.status >= 500;
+  if(isA2EStructuredError){
+    j.friendly = friendlyA2E(j);
+    j.retryable = false;
+  } else if(isUpstreamServerError){
+    j.friendly = 'The provider is having trouble. Try again in a minute.';
+    j.retryable = true;
+  } else if(!r.ok){
+    j.friendly = `Provider returned HTTP ${r.status}.`;
+    j.retryable = r.status >= 500;
+  }
+  return j;
+}
+
+function handleA2eStatus(req, res){
+  const kind = (req.body?.kind || req.query?.kind || '').toLowerCase();
+  const id   = (req.body?.id   || req.query?.id   || '').toString();
+  // The action may also tell us the kind: image_status → image, video_status → video
+  const action = (req.body?.action || '').toLowerCase();
+  const resolvedKind = kind || (action === 'video_status' ? 'video' : action === 'image_status' ? 'image' : '');
+  if(!resolvedKind){
+    return res.status(400).json({ code: -1, message: 'kind (image|video) or action (image_status|video_status) required', friendly: 'Specify kind=image or kind=video in the poll request.', retryable: false });
+  }
+  a2eStatusFetch(resolvedKind, id).then(j => res.json(j));
+}
+
+app.post('/a2e/status', handleA2eStatus);
+app.get('/a2e/status',  handleA2eStatus);
 
 /* ============================================================================
    OpenAI
