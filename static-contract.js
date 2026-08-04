@@ -5,9 +5,10 @@ for (const required of [
   "const model = 'gpt-image-2'",
   '/v1/images/edits',
   '/v1/images/generations',
+  '/v1/videos',
+  'sora-2',
   'APP_PROXY_TOKEN',
   'assertPublicHttpsUrl',
-  "res.status(410)",
   'AbortController',
 ]) {
   if (!source.includes(required)) throw new Error(`Missing proxy contract: ${required}`);
@@ -16,6 +17,8 @@ for (const forbidden of [
   '/v1/usage?date=',
   ':predictLongRunning',
   "body.input_reference = input_reference",
+  // 410 video stub is gone now that the real Sora 2 route is wired.
+  "'openai_video_disabled'",
 ]) {
   if (source.includes(forbidden)) throw new Error(`Forbidden stale provider contract: ${forbidden}`);
 }

@@ -282,7 +282,7 @@ app.get('/', (_req, res) => {
     capabilities: {
       openai_images: true,
       openai_reference_edit: true,
-      openai_video: false,
+      openai_video: true,           // Sora 2 — deprecated 2026-09-24, still live
       a2e_images: true,
       a2e_video: true,
       gemini: false,
@@ -338,12 +338,114 @@ app.post('/openai/images', async (req, res, next) => {
   }
 });
 
-app.all('/openai/videos*', (_req, res) => {
-  res.status(410).json(errorBody(
-    'openai_video_disabled',
-    'OpenAI video generation is disabled because the configured Sora models are deprecated. Use A2E for clips.',
-    false
-  ));
+// OpenAI Sora 2 video (still live; scheduled for removal 2026-09-24).
+// POST /openai/videos            -> start a job, returns {id, status}
+// GET  /openai/videos/:id        -> poll status
+// GET  /openai/videos/:id/content -> proxy the MP4 bytes (CORS-safe)
+//
+// Sora 2 sizes: 720x1280, 1280x720. sora-2-pro adds 1024x1792, 1792x1024.
+// We always default to sora-2 and accept 16:9 / 9:16 only. Square aspect
+// is not supported by Sora — the front-end should pick a valid aspect.
+function soraSize(aspect) {
+  if (aspect === '9:16') return '720x1280';
+  if (aspect === '1:1')  return '720x720';  // Sora will reject; UI should pick 16:9 or 9:16
+  return '1280x720';
+}
+function soraSeconds(value) {
+  if (value === 'short') return '4';
+  if (value === 'long')  return '12';
+  return '8';
+}
+
+app.post('/openai/videos', async (req, res, next) => {
+  const key = requireKey('openai', req, res);
+  if (!key) return;
+  try {
+    const prompt = requiredString(req.body?.prompt, 'prompt', 4000);
+    const model  = String(req.body?.model || 'sora-2');
+    const size   = enumValue(req.body?.size, ['720x1280', '1280x720', '1024x1792', '1792x1024'], soraSize(req.body?.aspectRatio));
+    const seconds = enumValue(req.body?.seconds, ['4', '8', '12'], soraSeconds(req.body?.duration));
+    const reference = typeof req.body?.input_reference === 'string' && req.body.input_reference.trim()
+      ? req.body.input_reference.trim()
+      : null;
+
+    // Sora 2 expects `input_reference` as an OBJECT in JSON requests
+    // ({ file_id } or { image_url }). A bare string or a data URL is rejected
+    // with "Invalid type for 'input_reference': expected an object".
+    // We forward the reference as { image_url } so the upstream can fetch
+    // it. data: URLs are passed through as-is — OpenAI accepts them.
+    const body = { model, prompt, size, seconds };
+    if (reference) {
+      body.input_reference = { image_url: reference };
+    }
+
+    const response = await upstreamFetch(`${PROVIDERS.openai.base}/v1/videos`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await readProviderJson(response, 'openai');
+    res.json({ ok: true, provider: 'openai', model, job_id: data.id, status: data.status || 'queued', raw: data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/openai/videos/:id', async (req, res, next) => {
+  const key = requireKey('openai', req, res);
+  if (!key) return;
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!id) {
+      return res.status(422).json(errorBody('validation_error', 'video id is required', false));
+    }
+    const response = await upstreamFetch(`${PROVIDERS.openai.base}/v1/videos/${encodeURIComponent(id)}`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${key}` },
+    });
+    const data = await readProviderJson(response, 'openai');
+    // Sora returns { id, status, progress, ... }. Surface the bits the front-end needs.
+    res.json({
+      ok: true,
+      provider: 'openai',
+      job_id: data.id || id,
+      status: data.status || 'in_progress',
+      progress: typeof data.progress === 'number' ? data.progress : null,
+      video_url: data.status === 'completed' ? `/openai/videos/${encodeURIComponent(id)}/content` : null,
+      error: data.error || null,
+      raw: data,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Proxy the MP4 bytes back to the browser so the <video> tag can stream them.
+app.get('/openai/videos/:id/content', async (req, res, next) => {
+  const key = requireKey('openai', req, res);
+  if (!key) return;
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(422).json(errorBody('validation_error', 'video id is required', false));
+    const upstream = await upstreamFetch(`${PROVIDERS.openai.base}/v1/videos/${encodeURIComponent(id)}/content`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${key}` },
+    });
+    if (!upstream.ok) {
+      const text = await upstream.text();
+      throw Object.assign(new Error(`Sora content fetch failed (${upstream.status})`), {
+        status: upstream.status,
+        code: 'provider_error',
+        providerBody: text.slice(0, 1000),
+      });
+    }
+    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'video/mp4');
+    res.setHeader('Cache-Control', 'no-store');
+    const buf = Buffer.from(await upstream.arrayBuffer());
+    res.end(buf);
+  } catch (error) {
+    next(error);
+  }
 });
 
 async function a2eRequest(key, action, payload) {
