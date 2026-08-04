@@ -1,15 +1,19 @@
 {
   "name": "curtis-a2e-proxy",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "CORS proxy + auth holder for the A2E.ai API, used by Curtis Image Gen (Trailer Studio).",
+  "description": "Constrained OpenAI image and A2E media proxy for Curtis Image Studio.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check": "node --check server.js && node static-contract.js",
+    "test": "npm run check"
   },
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "express": "^4.19.2",
-    "cors": "^2.8.5"
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
   }
 }
