@@ -2,6 +2,8 @@
 
 const express = require('express');
 const cors = require('cors');
+const dns = require('dns').promises;
+const net = require('net');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -178,6 +180,66 @@ function parseDataUrl(value) {
   return { mime: match[1], bytes };
 }
 
+function isPrivateAddress(address) {
+  if (net.isIP(address) === 4) {
+    const parts = address.split('.').map(Number);
+    const [a, b] = parts;
+    return a === 0 || a === 10 || a === 127 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      a >= 224;
+  }
+  if (net.isIP(address) === 6) {
+    const normalized = address.toLowerCase();
+    if (normalized === '::' || normalized === '::1') return true;
+    if (normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe8') ||
+        normalized.startsWith('fe9') || normalized.startsWith('fea') || normalized.startsWith('feb')) return true;
+    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(normalized);
+    return mapped ? isPrivateAddress(mapped[1]) : false;
+  }
+  return true;
+}
+
+async function assertPublicHttpsUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw Object.assign(new Error('Reference must be a data URL or an HTTPS image URL.'), { status: 422 });
+  }
+  if (url.protocol !== 'https:') throw Object.assign(new Error('Only HTTPS reference URLs are allowed.'), { status: 422 });
+  if (url.username || url.password) throw Object.assign(new Error('Reference URLs cannot contain credentials.'), { status: 422 });
+  const hostname = url.hostname.toLowerCase();
+  if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local')) {
+    throw Object.assign(new Error('Private reference hosts are not allowed.'), { status: 422 });
+  }
+  const addresses = net.isIP(hostname)
+    ? [{ address: hostname }]
+    : await dns.lookup(hostname, { all: true, verbatim: true });
+  if (!addresses.length || addresses.some(({ address }) => isPrivateAddress(address))) {
+    throw Object.assign(new Error('Private reference hosts are not allowed.'), { status: 422 });
+  }
+  return url;
+}
+
+async function fetchPublicImage(value) {
+  let url = await assertPublicHttpsUrl(value);
+  for (let redirect = 0; redirect <= 3; redirect += 1) {
+    const response = await upstreamFetch(url, { redirect: 'manual' });
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get('location');
+      if (!location) throw Object.assign(new Error('Reference URL redirected without a destination.'), { status: 422 });
+      url = await assertPublicHttpsUrl(new URL(location, url).toString());
+      continue;
+    }
+    return response;
+  }
+  throw Object.assign(new Error('Reference URL redirected too many times.'), { status: 422 });
+}
+
 async function loadImageInput(input) {
   const value = requiredString(input, 'input_reference', 16 * 1024 * 1024);
   const data = parseDataUrl(value);
@@ -187,18 +249,12 @@ async function loadImageInput(input) {
     return data;
   }
 
-  let url;
-  try {
-    url = new URL(value);
-  } catch {
-    throw Object.assign(new Error('Reference must be a data URL or an HTTPS image URL.'), { status: 422 });
-  }
-  if (url.protocol !== 'https:') throw Object.assign(new Error('Only HTTPS reference URLs are allowed.'), { status: 422 });
-
-  const response = await upstreamFetch(url, { redirect: 'follow' });
+  const response = await fetchPublicImage(value);
   if (!response.ok) throw Object.assign(new Error(`Could not download the reference image (HTTP ${response.status}).`), { status: 422 });
   const mime = (response.headers.get('content-type') || '').split(';')[0].trim();
   if (!mime.startsWith('image/')) throw Object.assign(new Error('Reference URL did not return an image.'), { status: 422 });
+  const declaredLength = Number(response.headers.get('content-length') || 0);
+  if (declaredLength > MAX_IMAGE_BYTES) throw Object.assign(new Error('Reference image is too large.'), { status: 413 });
   const bytes = Buffer.from(await response.arrayBuffer());
   if (bytes.length > MAX_IMAGE_BYTES) throw Object.assign(new Error('Reference image is too large.'), { status: 413 });
   return { mime, bytes };
