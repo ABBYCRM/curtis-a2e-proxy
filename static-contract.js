@@ -12,6 +12,7 @@ for (const required of [
   'AbortController',
   'ALBUM_DIR',
   'saveAssetToAlbum',
+  '/album/save-from-url',
 ]) {
   if (!source.includes(required)) throw new Error(`Missing proxy contract: ${required}`);
 }

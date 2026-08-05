@@ -904,6 +904,74 @@ app.delete('/album', async (_req, res, next) => {
   } catch (error) { next(error); }
 });
 
+// Save an asset to the album by URL. The proxy downloads the bytes
+// server-side (so CORS doesn't bite the browser), runs the same
+// assertPublicHttpsUrl guard we use for reference images, and stores
+// the result through saveAssetToAlbum. Used when the front-end has an
+// external URL it can't fetch itself (e.g. an A2E result_url that
+// doesn't return CORS headers, or a Sora 2 content URL that requires
+// the x-openai-key header).
+app.post('/album/save-from-url', async (req, res, next) => {
+  try {
+    const kind = String(req.body?.kind || '').trim();
+    if (!['image', 'video'].includes(kind)) {
+      return res.status(422).json(errorBody('validation_error', 'kind must be "image" or "video"', false));
+    }
+    const sourceUrl = requiredString(req.body?.url, 'url', 2048);
+    const provider = String(req.body?.provider || '').trim() || null;
+    const prompt = req.body?.prompt ? String(req.body.prompt).slice(0, 1000) : null;
+    const title = req.body?.title ? String(req.body.title).slice(0, 200) : null;
+    const sceneN = req.body?.scene_n != null ? Number(req.body.scene_n) : null;
+
+    // HTTPS-only and SSRF-checked (the same guard we use for GPT Image 2
+    // input_reference). Without this, an attacker could pivot through
+    // the proxy to read AWS metadata at 169.254.169.254 or hit internal
+    // services on the proxy's private network.
+    await assertPublicHttpsUrl(sourceUrl);
+
+    // Some upstream providers (notably Sora 2's /v1/videos/:id/content
+    // route) require an Authorization header that the proxy already
+    // has. If the request came in with x-openai-key / x-a2e-key, reuse
+    // it for the upstream fetch. If only x-app-token is set and the
+    // proxy has env-stored keys, use the env key.
+    const upstreamHeaders = {};
+    const openaiHeader = String(req.get('x-openai-key') || '').trim();
+    const a2eHeader = String(req.get('x-a2e-key') || '').trim();
+    if (openaiHeader) upstreamHeaders.Authorization = `Bearer ${openaiHeader}`;
+    else if (APP_PROXY_TOKEN && String(req.get('x-app-token') || '').trim() === APP_PROXY_TOKEN) {
+      const envKey = PROVIDERS.openai.envKey();
+      if (envKey) upstreamHeaders.Authorization = `Bearer ${envKey}`;
+    }
+    if (!upstreamHeaders.Authorization && a2eHeader) upstreamHeaders.Authorization = `Bearer ${a2eHeader}`;
+
+    const upstream = await upstreamFetch(sourceUrl, { headers: upstreamHeaders });
+    if (!upstream.ok) {
+      const text = await upstream.text().catch(() => '');
+      throw Object.assign(new Error(`Upstream fetch failed (${upstream.status}): ${text.slice(0, 200)}`), {
+        status: upstream.status,
+        code: 'upstream_error',
+        retryable: upstream.status === 429 || upstream.status >= 500,
+      });
+    }
+    const bytes = Buffer.from(await upstream.arrayBuffer());
+    const declaredMime = (upstream.headers.get('content-type') || '').split(';')[0].trim();
+    const mime = declaredMime || (kind === 'image' ? 'image/png' : 'video/mp4');
+    if (bytes.length === 0) throw Object.assign(new Error('Upstream returned empty body'), { status: 502, code: 'empty_body' });
+    if (bytes.length > 50 * 1024 * 1024) throw Object.assign(new Error('Asset exceeds 50 MB'), { status: 413, code: 'too_large' });
+
+    const id = await saveAssetToAlbum({
+      kind,
+      bytes,
+      mime,
+      prompt,
+      title,
+      provider,
+      scene_n: sceneN,
+    });
+    res.json({ ok: true, id, url: `/album/${id}`, bytes: bytes.length, kind, mime });
+  } catch (error) { next(error); }
+});
+
 app.use((error, _req, res, _next) => {
   console.error('[proxy]', error.code || error.name, error.message);
   const status = Number(error.status || 500);
