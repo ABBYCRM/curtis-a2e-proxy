@@ -15,6 +15,11 @@ const BUILD_SHA = process.env.RENDER_GIT_COMMIT || process.env.GIT_SHA || 'dev';
 const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 120000);
 const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES || 10 * 1024 * 1024);
 const APP_PROXY_TOKEN = (process.env.APP_PROXY_TOKEN || '').trim();
+// Rate limit defaults match the README. The previous hard-coded
+// values silently ignored these env vars — operators who set
+// RATE_LIMIT_MAX to a different value would still get 60/min.
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 60);
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000);
 const ALLOWED_ORIGINS = new Set(
   (process.env.ALLOWED_ORIGINS ||
     'https://curtis-image-gen.onrender.com,http://localhost:8080,http://127.0.0.1:8080')
@@ -62,17 +67,21 @@ app.use('/album/upload', express.raw({ type: ['image/png', 'image/jpeg', 'image/
 const buckets = new Map();
 function rateLimit(req, res, next) {
   const now = Date.now();
-  const key = `${req.ip}:${Math.floor(now / 60000)}`;
+  const window = Math.floor(now / RATE_LIMIT_WINDOW_MS);
+  const key = `${req.ip}:${window}`;
   const count = (buckets.get(key) || 0) + 1;
   buckets.set(key, count);
-  if (buckets.size > 5000) {
+  // Periodically prune buckets older than two windows so the map
+  // doesn't grow unbounded. The size guard is a backstop; the prune
+  // call is what actually frees memory.
+  if (buckets.size > 5000 || (count === 1 && buckets.size > 1000)) {
     for (const [bucketKey] of buckets) {
-      const minute = Number(bucketKey.split(':').pop());
-      if (minute < Math.floor(now / 60000) - 2) buckets.delete(bucketKey);
+      const bucketWindow = Number(bucketKey.split(':').pop());
+      if (bucketWindow < window - 2) buckets.delete(bucketKey);
     }
   }
-  if (count > 60) {
-    return res.status(429).json(errorBody('rate_limited', 'Too many requests. Try again in a minute.', true));
+  if (count > RATE_LIMIT_MAX) {
+    return res.status(429).json(errorBody('rate_limited', `Too many requests. Cap is ${RATE_LIMIT_MAX} per ${RATE_LIMIT_WINDOW_MS / 1000}s.`, true));
   }
   next();
 }
@@ -388,10 +397,13 @@ app.post('/openai/images', async (req, res, next) => {
 //
 // Sora 2 sizes: 720x1280, 1280x720. sora-2-pro adds 1024x1792, 1792x1024.
 // We always default to sora-2 and accept 16:9 / 9:16 only. Square aspect
-// is not supported by Sora — the front-end should pick a valid aspect.
+// (1:1) is NOT supported by Sora 2 — we throw a clean 422 so the front-end
+// shows a real error instead of waiting two minutes for Sora to reject.
 function soraSize(aspect) {
   if (aspect === '9:16') return '720x1280';
-  if (aspect === '1:1')  return '720x720';  // Sora will reject; UI should pick 16:9 or 9:16
+  if (aspect === '1:1') {
+    throw Object.assign(new Error('Sora 2 does not support 1:1. Use 16:9 or 9:16.'), { status: 422, code: 'unsupported_aspect' });
+  }
   return '1280x720';
 }
 function soraSeconds(value) {
@@ -504,9 +516,13 @@ app.get('/openai/videos/:id/content', async (req, res, next) => {
     res.setHeader('Content-Type', upstream.headers.get('content-type') || 'video/mp4');
     res.setHeader('Cache-Control', 'no-store');
     const buf = Buffer.from(await upstream.arrayBuffer());
-    // Persist to the album. We use the prompt from the original job — the
-    // front-end sends it in the x-scene-prompt header on the content fetch.
-    // (CORS-safe: this is a server-side read, not browser code.)
+    res.end(buf);
+    // Persist to the album after the response is sent. We use the prompt
+    // the front-end sent in x-scene-prompt so the album card has a real
+    // title. The save is fire-and-forget: a failure here is logged but
+    // never blocks the user from getting their video. The front-end also
+    // re-uploads the bytes, so the album stays in sync even if this
+    // server-side save failed for any reason.
     const scenePrompt = String(req.headers['x-scene-prompt'] || '').trim() || `Sora 2 clip ${id}`;
     saveAssetToAlbum({
       kind: 'video',
@@ -516,10 +532,7 @@ app.get('/openai/videos/:id/content', async (req, res, next) => {
       title: scenePrompt.slice(0, 80),
       provider: 'openai',
       scene_n: null,
-    }).then((assetId) => {
-      if (assetId) res.setHeader('x-album-id', assetId);
     }).catch((err) => { console.error('[proxy] album save failed:', err.message); });
-    res.end(buf);
   } catch (error) {
     next(error);
   }
@@ -629,7 +642,11 @@ async function saveAssetToAlbum({ kind, url, bytes, mime, prompt, title, provide
     buffer = parsed.bytes;
   } else if (typeof url === 'string' && /^https?:$/.test(new URL(url).protocol)) {
     const res = await upstreamFetch(url);
-    if (!res.ok) throw new Error(`Failed to fetch asset URL: HTTP ${res.status}`);
+    if (!res.ok) {
+      throw Object.assign(new Error(`Failed to fetch asset URL: HTTP ${res.status}`), {
+        status: 502, code: 'upstream_error', retryable: res.status === 429 || res.status >= 500,
+      });
+    }
     buffer = Buffer.from(await res.arrayBuffer());
   } else {
     throw new Error('Asset must be a data URL, https URL, or Buffer');
@@ -643,12 +660,16 @@ async function saveAssetToAlbum({ kind, url, bytes, mime, prompt, title, provide
 
   let width = null;
   let height = null;
-  if (kind === 'image' && mime === 'image/png') {
+  // Probe image dimensions for any image/* the front-end might send.
+  // The original code only probed PNG, so JPEG / WebP album entries
+  // always showed "?" in the resolution. sharp handles all three
+  // and a 1K JPEG metadata read is sub-millisecond.
+  if (kind === 'image' && mime.startsWith('image/')) {
     try {
       const probe = await sharp(buffer).metadata();
       width = probe.width || null;
       height = probe.height || null;
-    } catch { /* ignore */ }
+    } catch { /* ignore — exotic image format we don't probe */ }
   }
 
   const meta = {
