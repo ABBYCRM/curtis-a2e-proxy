@@ -96,6 +96,18 @@ function errorBody(code, message, retryable = false, details) {
   };
 }
 
+// Attach an `actionable` field if the error carries one. Used by
+// the front-end to switch behavior (e.g. skip a video instead of
+// fail the run when Sora 2 is gated).
+function errorBodyWith(error) {
+  const code = error.code || 'proxy_error';
+  const message = error.message;
+  const retryable = Boolean(error.retryable || error.status === 429 || (error.status >= 500 && error.status < 600));
+  const body = errorBody(code, message, retryable);
+  if (error.actionable) body.actionable = error.actionable;
+  return body;
+}
+
 function resolveKey(providerName, req) {
   const provider = PROVIDERS[providerName];
   if (!provider) return '';
@@ -109,11 +121,12 @@ function resolveKey(providerName, req) {
 function requireKey(providerName, req, res) {
   const key = resolveKey(providerName, req);
   if (key) return key;
-  res.status(401).json(errorBody(
-    'missing_provider_key',
-    `A ${providerName === 'openai' ? 'OpenAI' : 'A2E'} API key is required. Paste it in Settings.`,
-    false
-  ));
+  res.status(401).json(errorBodyWith({
+    code: 'missing_provider_key',
+    message: `A ${providerName === 'openai' ? 'OpenAI' : 'A2E'} API key is required. Open Settings, paste a key, and Save.`,
+    retryable: false,
+    actionable: 'paste_key',
+  }));
   return null;
 }
 
@@ -184,6 +197,33 @@ async function readProviderJson(response, providerName) {
     error.code = body?.error?.code || 'provider_error';
     error.retryable = response.status === 429 || response.status >= 500;
     error.providerBody = body;
+    // Sora 2 / GPT Image 2 are gated. Detect the specific 403
+    // patterns and stamp a machine-readable code + a user-actionable
+    // message. The front-end reads `error.code` to switch the
+    // banner and decide whether to fall back to A2E. Without this,
+    // every 403 looks the same to the user.
+    if (response.status === 403 && providerName === 'openai') {
+      const lower = String(providerMessage).toLowerCase();
+      if (lower.includes('organization must be verified')
+        || lower.includes('verify organization')) {
+        error.code = 'openai_org_not_verified';
+        error.message = 'Sora 2 requires OpenAI Organization Verification. Go to https://platform.openai.com/settings/organization/general and click Verify Organization. Allow up to 15 minutes for access to propagate.';
+        error.actionable = 'verify_organization';
+        error.retryable = false;
+      } else if (lower.includes('does not have access to model')
+        || lower.includes('model_not_found')
+        || lower.includes("don't have access to this resource")) {
+        error.code = 'openai_model_not_enabled';
+        error.message = `Your OpenAI project does not have access to this model. Enable it at https://platform.openai.com/settings/project (Limits → Model Usage), or switch the Provider dropdown to A2E.`;
+        error.actionable = 'enable_model';
+        error.retryable = false;
+      } else if (lower.includes('billing') || lower.includes('payment') || lower.includes('invoice')) {
+        error.code = 'openai_billing_issue';
+        error.message = 'OpenAI suspended access for billing. Settle the outstanding invoice at https://platform.openai.com/account/billing, or switch to A2E.';
+        error.actionable = 'fix_billing';
+        error.retryable = false;
+      }
+    }
     throw error;
   }
   return body;
@@ -996,11 +1036,13 @@ app.post('/album/save-from-url', async (req, res, next) => {
 app.use((error, _req, res, _next) => {
   console.error('[proxy]', error.code || error.name, error.message);
   const status = Number(error.status || 500);
-  const retryable = Boolean(error.retryable || status === 429 || status >= 500);
+  // For 5xx that aren't retryable, hide the internal message and
+  // show a generic one. 4xx errors are user-actionable and should
+  // pass through so the user can fix them.
   const safeMessage = status >= 500 && !error.retryable
     ? 'The proxy encountered an unexpected error.'
     : error.message;
-  res.status(status).json(errorBody(error.code || 'proxy_error', safeMessage, retryable));
+  res.status(status).json(errorBodyWith({ ...error, message: safeMessage }));
 });
 
 app.listen(PORT, () => {
