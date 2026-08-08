@@ -192,37 +192,74 @@ async function readProviderJson(response, providerName) {
 
   if (!response.ok) {
     const providerMessage = body?.error?.message || body?.message || body?.msg || `Provider returned HTTP ${response.status}`;
+    const upstreamCode = body?.error?.code || null;
     const error = new Error(providerMessage);
     error.status = response.status;
-    error.code = body?.error?.code || 'provider_error';
+    error.code = upstreamCode || 'provider_error';
     error.retryable = response.status === 429 || response.status >= 500;
     error.providerBody = body;
-    // Sora 2 / GPT Image 2 are gated. Detect the specific 403
-    // patterns and stamp a machine-readable code + a user-actionable
-    // message. The front-end reads `error.code` to switch the
-    // banner and decide whether to fall back to A2E. Without this,
-    // every 403 looks the same to the user.
+    // Sora 2 / GPT Image 2 are gated. We classify the 4 most
+    // common 403 patterns and stamp a machine-readable code +
+    // a user-actionable message. The front-end reads `error.code`
+    // to switch the banner and decide whether to fall back to A2E.
+    //
+    // Two signals: the upstream `code` (e.g. `permission_denied`,
+    // `model_not_found`, `invalid_request_error`) AND the
+    // message text. The upstream code is the more reliable
+    // signal — we trust it first. The message is the fallback
+    // for cases where OpenAI doesn't stamp a code.
     if (response.status === 403 && providerName === 'openai') {
       const lower = String(providerMessage).toLowerCase();
-      if (lower.includes('organization must be verified')
-        || lower.includes('verify organization')) {
+      // 1. Org not verified — must verify before any model is available.
+      if (upstreamCode === 'organization_not_verified'
+        || lower.includes('organization must be verified')
+        || lower.includes('verify organization')
+        || lower.includes('must be verified to use the model')) {
         error.code = 'openai_org_not_verified';
-        error.message = 'Sora 2 requires OpenAI Organization Verification. Go to https://platform.openai.com/settings/organization/general and click Verify Organization. Allow up to 15 minutes for access to propagate.';
+        error.message = 'Sora 2 / GPT Image 2 require OpenAI Organization Verification. Go to https://platform.openai.com/settings/organization/general and click Verify Organization (phone + government ID required). Allow up to 15 minutes for access to propagate.';
         error.actionable = 'verify_organization';
         error.retryable = false;
-      } else if (lower.includes('does not have access to model')
-        || lower.includes('model_not_found')
-        || lower.includes("don't have access to this resource")) {
+      }
+      // 2. Model not enabled on the project — `model_not_found`
+      // from OpenAI, or message text matching the project-not-
+      // -allowed-to-model pattern. This is the most common 403
+      // for project-scoped (`sk-proj-…`) keys.
+      else if (upstreamCode === 'model_not_found'
+        || lower.includes('does not have access to model')
+        || lower.includes("don't have access to this resource")
+        || lower.includes('you do not have access')) {
         error.code = 'openai_model_not_enabled';
         error.message = `Your OpenAI project does not have access to this model. Enable it at https://platform.openai.com/settings/project (Limits → Model Usage), or switch the Provider dropdown to A2E.`;
         error.actionable = 'enable_model';
         error.retryable = false;
-      } else if (lower.includes('billing') || lower.includes('payment') || lower.includes('invoice')) {
+      }
+      // 3. Bare `permission_denied` with no message — same fix
+      // path as #2. OpenAI sometimes returns just the code with
+      // a generic message.
+      else if (upstreamCode === 'permission_denied') {
+        error.code = 'openai_model_not_enabled';
+        error.message = `OpenAI returned permission_denied. Your project likely does not have access to this model. Enable it at https://platform.openai.com/settings/project (Limits → Model Usage), or switch the Provider dropdown to A2E.`;
+        error.actionable = 'enable_model';
+        error.retryable = false;
+      }
+      // 4. Wrong OpenAI-Organization header on the request.
+      else if (lower.includes('openai-organization header')) {
+        error.code = 'openai_org_header_mismatch';
+        error.message = 'The OpenAI-Organization header does not match the key\'s owning organization. The proxy does not send this header for project-scoped keys. If you have multiple organizations, mint a key under the correct project.';
+        error.actionable = 'fix_org_header';
+        error.retryable = false;
+      }
+      // 5. Billing — invoice unpaid or tier downgraded.
+      else if (lower.includes('billing') || lower.includes('payment') || lower.includes('invoice') || lower.includes('plan')) {
         error.code = 'openai_billing_issue';
         error.message = 'OpenAI suspended access for billing. Settle the outstanding invoice at https://platform.openai.com/account/billing, or switch to A2E.';
         error.actionable = 'fix_billing';
         error.retryable = false;
       }
+      // 6. Any other 403 — fall through to a generic "forbidden"
+      // message but keep the original message in the log so the
+      // operator can diagnose. The front-end will show the new
+      // "Switch to A2E" button.
     }
     throw error;
   }

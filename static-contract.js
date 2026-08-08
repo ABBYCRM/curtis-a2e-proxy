@@ -25,6 +25,19 @@ for (const required of [
   'pruneAlbum', 'enforceTotalBytes',
   // Security
   'APP_PROXY_TOKEN', 'assertPublicHttpsUrl', 'isPrivateAddress',
+  // 403 classification — the proxy must label the 5 most common
+  // OpenAI gating patterns. The front-end reads `error.code` to
+  // switch the banner; missing any of these means the user falls
+  // back to the generic "HTTP 403" message and doesn't know what
+  // to do.
+  'openai_org_not_verified',
+  'openai_model_not_enabled',
+  'openai_org_header_mismatch',
+  'openai_billing_issue',
+  // Upstream codes we trust directly (when present).
+  "'permission_denied'",
+  "'model_not_found'",
+  "'organization_not_verified'",
   // Utilities
   'AbortController', 'sharp', 'fs.createReadStream',
   // Rate limit env vars (now actually used)
