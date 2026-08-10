@@ -18,20 +18,36 @@ jobs:
       - name: Install Grok CLI
         run: curl -fsSL https://x.ai/cli/install.sh | bash
 
-      - name: Run Grok review
+      - name: Run Grok review and post to PR
         env:
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          # Add Grok CLI to PATH
           export PATH="$HOME/.local/bin:$PATH"
 
-          # Gather PR context
           PR_NUMBER="${{ github.event.pull_request.number }}"
           REPO="${{ github.repository }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
           echo "Reviewing PR #${PR_NUMBER} in ${REPO} @ ${HEAD_SHA}"
 
-          # Run Grok with PR review prompt
-          grok -p "Review PR #${PR_NUMBER} in ${REPO}. Run: gh pr diff ${PR_NUMBER} --repo ${REPO}. Look for bugs, security issues, and broken logic. Post your review as a PR comment using: gh pr review ${PR_NUMBER} --repo ${REPO} --comment --body 'your review here'" --always-approve
+          # Capture review to a file
+          REVIEW_FILE="/tmp/grok-review.md"
+          grok -p "Review PR #${PR_NUMBER} in ${REPO}. Use the GitHub API to fetch the diff (curl -H 'Authorization: token \$GH_TOKEN' https://api.github.com/repos/${REPO}/pulls/${PR_NUMBER}). Look for bugs, security issues, and broken logic. Output a Markdown review with these sections: ## Summary, ## Findings (bulleted, grouped by category: Bugs / Security / Performance / Style), ## Verdict (one of: LGTM, Request Changes, Needs Discussion). Be terse and direct. Do not post anything — just print the review." --always-approve > "$REVIEW_FILE" 2>&1
+
+          echo "---- Review output ----"
+          cat "$REVIEW_FILE"
+          echo "---- End review ----"
+
+          # Strip ANSI escape codes before posting
+          REVIEW_CLEAN=$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b\[[?][0-9]*[hl]//g' "$REVIEW_FILE" | tail -n +2)
+
+          # Post to PR as a comment via the GitHub API
+          PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'body': sys.argv[1]}))" "$REVIEW_CLEAN")
+
+          curl -s -X POST "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print('Posted comment:', d.get('html_url', d.get('message','?')))"
