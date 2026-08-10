@@ -6,6 +6,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  checks: write
 
 jobs:
   review:
@@ -19,10 +20,12 @@ jobs:
         run: curl -fsSL https://x.ai/cli/install.sh | bash
 
       - name: Run Grok review and post to PR
+        id: review
         env:
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
+          set -uo pipefail
           export PATH="$HOME/.local/bin:$PATH"
 
           PR_NUMBER="${{ github.event.pull_request.number }}"
@@ -50,4 +53,64 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" \
-            | python3 -c "import json,sys; d=json.load(sys.stdin); print('Posted comment:', d.get('html_url', d.get('message','?')))"
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print('Posted comment:', d.get('html_url', d.get('message','?')))" || true
+
+          # Detect verdict
+          if echo "$REVIEW_CLEAN" | grep -qi "verdict.*LGTM\|## Verdict\s*$\|^LGTM\b"; then
+            echo "VERDICT=approved" >> "$GITHUB_OUTPUT"
+            VERDICT="approved"
+          elif echo "$REVIEW_CLEAN" | grep -qi "Request Changes"; then
+            echo "VERDICT=changes_requested" >> "$GITHUB_OUTPUT"
+            VERDICT="changes_requested"
+          else
+            echo "VERDICT=neutral" >> "$GITHUB_OUTPUT"
+            VERDICT="neutral"
+          fi
+          echo "Detected verdict: $VERDICT"
+
+  gate:
+    needs: review
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Enforce Grok verdict
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          RESULT="${{ steps.review.outputs.VERDICT }}"
+
+          if [ "$RESULT" = "approved" ]; then
+            CONCLUSION="success"
+            SUMMARY="✅ Grok approved this PR"
+          elif [ "$RESULT" = "changes_requested" ]; then
+            CONCLUSION="failure"
+            SUMMARY="❌ Grok requested changes"
+          else
+            CONCLUSION="neutral"
+            SUMMARY="⚠️ Grok verdict unclear"
+          fi
+
+          echo "Gating with conclusion: $CONCLUSION"
+
+          PAYLOAD=$(python3 -c "
+import json
+print(json.dumps({
+  'name': 'Grok Review Gate',
+  'head_sha': '$SHA',
+  'status': 'completed',
+  'conclusion': '$CONCLUSION',
+  'output': {
+    'title': 'Grok PR Review',
+    'summary': '$SUMMARY'
+  }
+}))
+")
+
+          curl -s -X POST "https://api.github.com/repos/${REPO}/check-runs" \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print('Check run:', d.get('html_url', d.get('message','?')))"
