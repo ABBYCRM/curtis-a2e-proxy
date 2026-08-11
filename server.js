@@ -11,7 +11,14 @@ const sharp = require('sharp');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
-const BUILD_SHA = process.env.RENDER_GIT_COMMIT || process.env.GIT_SHA || 'dev';
+// Build SHA — used as the X-Build-Sha response header so the
+// operator can confirm which commit is live. Priority order:
+//   1. RENDER_GIT_COMMIT  (Render convention; survives a Render deploy)
+//   2. GIT_SHA            (generic; works on Heroku-style platforms)
+//   3. COMMIT_HASH        (DO App Platform bindable variable per
+//                          https://docs.digitalocean.com/products/app-platform/how-to/use-environment-variables/)
+//   4. 'dev'              (local fallback)
+const BUILD_SHA = process.env.RENDER_GIT_COMMIT || process.env.GIT_SHA || process.env.COMMIT_HASH || 'dev';
 const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 120000);
 const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES || 10 * 1024 * 1024);
 const APP_PROXY_TOKEN = (process.env.APP_PROXY_TOKEN || '').trim();
@@ -273,30 +280,6 @@ function parseDataUrl(value) {
   return { mime: match[1], bytes };
 }
 
-// Read PNG dimensions from the IHDR chunk (bytes 16-23, big-endian).
-// Returns {width, height} or null if the bytes aren't a PNG.
-// We only need this so Sora 2 doesn't reject a 1024x1024 reference when
-// the requested size is 1280x720 ("Inpaint image must match the
-// requested width and height").
-function pngDims(bytes) {
-  if (bytes.length < 24) return null;
-  if (bytes[0] !== 0x89 || bytes[1] !== 0x50 || bytes[2] !== 0x4e || bytes[3] !== 0x47) return null;
-  if (bytes[12] !== 0x49 || bytes[13] !== 0x48 || bytes[14] !== 0x44 || bytes[15] !== 0x52) return null;
-  return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
-}
-
-// Pick the Sora 2 size that best matches a reference image's aspect ratio.
-// Sora 2 only supports 720x1280 and 1280x720. We snap the reference's
-// aspect to one of those two.
-function soraSizeForRef(refDims, requested) {
-  if (!refDims || !refDims.width || !refDims.height) return requested || '1280x720';
-  const refIsPortrait = refDims.height > refDims.width;
-  // If the requested size matches the reference's orientation, keep it.
-  const reqIsPortrait = requested && requested.startsWith('720x');
-  if (reqIsPortrait === refIsPortrait) return requested;
-  return refIsPortrait ? '720x1280' : '1280x720';
-}
-
 function isPrivateAddress(address) {
   if (net.isIP(address) === 4) {
     const parts = address.split('.').map(Number);
@@ -325,19 +308,19 @@ async function assertPublicHttpsUrl(value) {
   try {
     url = new URL(value);
   } catch {
-    throw Object.assign(new Error('Reference must be a data URL or an HTTPS image URL.'), { status: 422 });
+    throw Object.assign(new Error('Reference must be a data URL or an HTTPS image URL.'), { status: 422, code: 'invalid_url' });
   }
-  if (url.protocol !== 'https:') throw Object.assign(new Error('Only HTTPS reference URLs are allowed.'), { status: 422 });
-  if (url.username || url.password) throw Object.assign(new Error('Reference URLs cannot contain credentials.'), { status: 422 });
+  if (url.protocol !== 'https:') throw Object.assign(new Error('Only HTTPS reference URLs are allowed.'), { status: 422, code: 'insecure_url' });
+  if (url.username || url.password) throw Object.assign(new Error('Reference URLs cannot contain credentials.'), { status: 422, code: 'invalid_url' });
   const hostname = url.hostname.toLowerCase();
   if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local')) {
-    throw Object.assign(new Error('Private reference hosts are not allowed.'), { status: 422 });
+    throw Object.assign(new Error('Private reference hosts are not allowed.'), { status: 422, code: 'private_host' });
   }
   const addresses = net.isIP(hostname)
     ? [{ address: hostname }]
     : await dns.lookup(hostname, { all: true, verbatim: true });
   if (!addresses.length || addresses.some(({ address }) => isPrivateAddress(address))) {
-    throw Object.assign(new Error('Private reference hosts are not allowed.'), { status: 422 });
+    throw Object.assign(new Error('Private reference hosts are not allowed.'), { status: 422, code: 'private_host' });
   }
   return url;
 }
@@ -348,13 +331,13 @@ async function fetchPublicImage(value) {
     const response = await upstreamFetch(url, { redirect: 'manual' });
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.get('location');
-      if (!location) throw Object.assign(new Error('Reference URL redirected without a destination.'), { status: 422 });
+      if (!location) throw Object.assign(new Error('Reference URL redirected without a destination.'), { status: 422, code: 'redirect_loop' });
       url = await assertPublicHttpsUrl(new URL(location, url).toString());
       continue;
     }
     return response;
   }
-  throw Object.assign(new Error('Reference URL redirected too many times.'), { status: 422 });
+  throw Object.assign(new Error('Reference URL redirected too many times.'), { status: 422, code: 'redirect_loop' });
 }
 
 async function loadImageInput(input) {
@@ -367,13 +350,13 @@ async function loadImageInput(input) {
   }
 
   const response = await fetchPublicImage(value);
-  if (!response.ok) throw Object.assign(new Error(`Could not download the reference image (HTTP ${response.status}).`), { status: 422 });
+  if (!response.ok) throw Object.assign(new Error(`Could not download the reference image (HTTP ${response.status}).`), { status: 422, code: 'reference_fetch_failed' });
   const mime = (response.headers.get('content-type') || '').split(';')[0].trim();
-  if (!mime.startsWith('image/')) throw Object.assign(new Error('Reference URL did not return an image.'), { status: 422 });
+  if (!mime.startsWith('image/')) throw Object.assign(new Error('Reference URL did not return an image.'), { status: 422, code: 'reference_not_image' });
   const declaredLength = Number(response.headers.get('content-length') || 0);
-  if (declaredLength > MAX_IMAGE_BYTES) throw Object.assign(new Error('Reference image is too large.'), { status: 413 });
+  if (declaredLength > MAX_IMAGE_BYTES) throw Object.assign(new Error('Reference image is too large.'), { status: 413, code: 'reference_too_large' });
   const bytes = Buffer.from(await response.arrayBuffer());
-  if (bytes.length > MAX_IMAGE_BYTES) throw Object.assign(new Error('Reference image is too large.'), { status: 413 });
+  if (bytes.length > MAX_IMAGE_BYTES) throw Object.assign(new Error('Reference image is too large.'), { status: 413, code: 'reference_too_large' });
   return { mime, bytes };
 }
 
