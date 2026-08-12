@@ -46,7 +46,20 @@ const PROVIDERS = {
     envKey: () => (process.env.OPENAI_API_KEY || '').trim(),
     requestHeader: 'x-openai-key',
   },
+  hedra: {
+    base: process.env.HEDRA_BASE_URL || 'https://api.hedra.com/web-app/public',
+    envKey: () => (process.env.HEDRA_API_KEY || '').trim(),
+    requestHeader: 'x-hedra-key',
+  },
 };
+
+// Hedra image-to-video model. `fal/grok-video-i2v` is the documented
+// slug for image + text-prompt driven clips (no audio asset required),
+// which matches this app's existing prompt-only video flow. Override
+// via env if Hedra renames/deprecates the slug.
+const HEDRA_VIDEO_MODEL_SLUG = process.env.HEDRA_VIDEO_MODEL_SLUG || 'fal/grok-video-i2v';
+// Hedra resolution enum per aspect-agnostic model docs: 540p / 720p / 1080p.
+const HEDRA_RESOLUTIONS = { low: '540p', medium: '720p', high: '1080p' };
 
 app.disable('x-powered-by');
 app.use((req, res, next) => {
@@ -62,7 +75,7 @@ app.use(cors({
     if (ALLOWED_ORIGINS.has(origin)) return callback(null, true);
     return callback(new Error(`Origin not allowed: ${origin}`));
   },
-  allowedHeaders: ['content-type', 'x-a2e-key', 'x-openai-key', 'x-app-token'],
+  allowedHeaders: ['content-type', 'x-a2e-key', 'x-openai-key', 'x-hedra-key', 'x-app-token'],
   methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
   maxAge: 600,
 }));
@@ -125,12 +138,14 @@ function resolveKey(providerName, req) {
   return '';
 }
 
+const PROVIDER_LABELS = { openai: 'OpenAI', a2e: 'A2E', hedra: 'Hedra' };
+
 function requireKey(providerName, req, res) {
   const key = resolveKey(providerName, req);
   if (key) return key;
   res.status(401).json(errorBodyWith({
     code: 'missing_provider_key',
-    message: `A ${providerName === 'openai' ? 'OpenAI' : 'A2E'} API key is required. Open Settings, paste a key, and Save.`,
+    message: `A ${PROVIDER_LABELS[providerName] || providerName} API key is required. Open Settings, paste a key, and Save.`,
     retryable: false,
     actionable: 'paste_key',
   }));
@@ -193,6 +208,24 @@ async function readProviderJson(response, providerName) {
     error.status = retryable ? 503 : 422;
     error.code = 'a2e_error';
     error.retryable = retryable;
+    error.providerBody = body;
+    throw error;
+  }
+
+  if (providerName === 'hedra' && !response.ok) {
+    // Hedra's public API returns FastAPI-style errors: either a plain
+    // string `detail`, or an array of Pydantic validation errors
+    // ([{ msg, loc, type }, ...]) on 422s.
+    const detail = body?.detail;
+    const message = typeof detail === 'string'
+      ? detail
+      : Array.isArray(detail)
+        ? detail.map((d) => d?.msg || JSON.stringify(d)).join('; ')
+        : null;
+    const error = new Error(message || `Hedra returned HTTP ${response.status}`);
+    error.status = response.status;
+    error.code = 'hedra_error';
+    error.retryable = response.status === 429 || response.status >= 500;
     error.providerBody = body;
     throw error;
   }
@@ -340,8 +373,8 @@ async function fetchPublicImage(value) {
   throw Object.assign(new Error('Reference URL redirected too many times.'), { status: 422, code: 'redirect_loop' });
 }
 
-async function loadImageInput(input) {
-  const value = requiredString(input, 'input_reference', 16 * 1024 * 1024);
+async function loadImageInput(input, fieldName = 'input_reference') {
+  const value = requiredString(input, fieldName, 16 * 1024 * 1024);
   const data = parseDataUrl(value);
   if (data) {
     if (!data.mime.startsWith('image/')) throw Object.assign(new Error('Reference must be an image.'), { status: 422 });
@@ -385,6 +418,7 @@ app.get('/', (_req, res) => {
       openai_video: true,           // Sora 2 — deprecated 2026-09-24, still live
       a2e_images: true,
       a2e_video: true,
+      hedra_video: true,
       gemini: false,
     },
     authentication: {
@@ -670,6 +704,107 @@ app.post('/a2e/status', async (req, res, next) => {
     const action = req.body?.action || (req.body?.kind ? `${req.body.kind}_status` : '');
     const result = await a2eRequest(key, requiredString(action, 'action', 64), { id: req.body?.id });
     res.json({ ok: true, ...result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ----- Hedra: image-to-video (fal/grok-video-i2v via Hedra's unified API) --
+// Flow (per https://www.hedra.com/docs/pages/developer/guides/generate-video):
+//   1. POST /assets              { name, type: "image" } -> { id }
+//   2. POST /assets/:id/upload   multipart file           -> asset ready
+//   3. POST /generations         { type: "video", model_slug, start_keyframe_id, generated_video_inputs }
+//   4. GET  /generations/:id/status  -> poll until status is "complete"
+// We collapse steps 1-3 into a single /hedra/video call so the front-end
+// keeps the same one-shot-submit shape it already uses for A2E and Sora 2.
+async function hedraUploadImageAsset(key, { name, mime, bytes }) {
+  const createResponse = await upstreamFetch(`${PROVIDERS.hedra.base}/assets`, {
+    method: 'POST',
+    headers: { 'X-API-Key': key, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, type: 'image' }),
+  });
+  const created = await readProviderJson(createResponse, 'hedra');
+  const assetId = created.id;
+  if (!assetId) {
+    throw Object.assign(new Error('Hedra did not return an asset id.'), { status: 502, code: 'hedra_error', retryable: true });
+  }
+
+  const form = new FormData();
+  form.append('file', new Blob([bytes], { type: mime }), name);
+  const uploadResponse = await upstreamFetch(`${PROVIDERS.hedra.base}/assets/${encodeURIComponent(assetId)}/upload`, {
+    method: 'POST',
+    headers: { 'X-API-Key': key },
+    body: form,
+  });
+  await readProviderJson(uploadResponse, 'hedra');
+  return assetId;
+}
+
+app.post('/hedra/video', async (req, res, next) => {
+  const key = requireKey('hedra', req, res);
+  if (!key) return;
+  try {
+    const prompt = requiredString(req.body?.prompt, 'prompt', 4000);
+    const aspectRatio = enumValue(req.body?.aspectRatio, ['16:9', '9:16', '1:1'], '16:9');
+    const resolution = enumValue(req.body?.resolution, ['540p', '720p', '1080p'], HEDRA_RESOLUTIONS.medium);
+    const durationMs = Number.isFinite(Number(req.body?.durationMs)) ? Math.max(1000, Math.min(30000, Number(req.body.durationMs))) : 5000;
+    const image = await loadImageInput(req.body?.image_url, 'image_url');
+
+    const keyframeId = await hedraUploadImageAsset(key, {
+      name: `curtis-frame-${Date.now()}.${image.mime.split('/')[1] || 'png'}`,
+      mime: image.mime,
+      bytes: image.bytes,
+    });
+
+    const generationResponse = await upstreamFetch(`${PROVIDERS.hedra.base}/generations`, {
+      method: 'POST',
+      headers: { 'X-API-Key': key, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'video',
+        model_slug: HEDRA_VIDEO_MODEL_SLUG,
+        start_keyframe_id: keyframeId,
+        generated_video_inputs: {
+          text_prompt: prompt,
+          aspect_ratio: aspectRatio,
+          resolution,
+          duration_ms: durationMs,
+        },
+      }),
+    });
+    const generation = await readProviderJson(generationResponse, 'hedra');
+    res.json({
+      ok: true,
+      provider: 'hedra',
+      model: HEDRA_VIDEO_MODEL_SLUG,
+      generation_id: generation.id,
+      status: generation.status || 'queued',
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/hedra/video/:id', async (req, res, next) => {
+  const key = requireKey('hedra', req, res);
+  if (!key) return;
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(422).json(errorBody('validation_error', 'generation id is required', false));
+    const response = await upstreamFetch(`${PROVIDERS.hedra.base}/generations/${encodeURIComponent(id)}/status`, {
+      method: 'GET',
+      headers: { 'X-API-Key': key },
+    });
+    const data = await readProviderJson(response, 'hedra');
+    res.json({
+      ok: true,
+      provider: 'hedra',
+      generation_id: data.id || id,
+      status: data.status || 'processing',
+      progress: typeof data.progress === 'number' ? data.progress : null,
+      video_url: data.status === 'complete' ? (data.url || data.download_url || null) : null,
+      error: data.error_message || data.error || null,
+      raw: data,
+    });
   } catch (error) {
     next(error);
   }

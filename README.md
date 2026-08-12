@@ -2,7 +2,7 @@
 
 A constrained provider proxy for Curtis Image Studio. Adds CORS, SSRF
 guard, rate limiting, and an `Album` asset store in front of the
-upstream image and video providers (OpenAI and A2E).
+upstream image and video providers (OpenAI, A2E, and Hedra).
 
 The live deployment is at **<https://curtis-a2e-proxy.onrender.com>**.
 
@@ -17,6 +17,8 @@ The live deployment is at **<https://curtis-a2e-proxy.onrender.com>**.
 | GET    | `/openai/videos/:id/content` | Sora 2 bytes (proxied with the user's key) |
 | POST   | `/a2e` | A2E image / video submit actions |
 | GET/POST | `/a2e/status` | A2E polling |
+| POST   | `/hedra/video` | Hedra image-to-video submit (uploads the frame, then starts the generation) |
+| GET    | `/hedra/video/:id` | Hedra generation status poll |
 | GET    | `/album` | List album items (newest first) |
 | POST   | `/album/upload?kind=image\|video&…` | Raw bytes upload (front-end auto-save) |
 | POST   | `/album/save-from-url` | Server-side fetch + SSRF guard + save (A2E clip URLs, Sora 2 bytes) |
@@ -34,12 +36,13 @@ Users may supply provider keys per request:
 
 - `x-openai-key` — OpenAI key (the front-end sends the user's localStorage value)
 - `x-a2e-key` — A2E key
+- `x-hedra-key` — Hedra key (from [hedra.com/api-profile](https://www.hedra.com/api-profile), Creator plan or above)
 - `x-app-token` — only required when `APP_PROXY_TOKEN` is set on the proxy
 
-Environment keys (`OPENAI_API_KEY`, `A2E_API_KEY`) are optional and
-protected. To allow the proxy to use them, configure `APP_PROXY_TOKEN`
-and have the caller send the same value in `x-app-token`. Without that
-token, environment keys are never used.
+Environment keys (`OPENAI_API_KEY`, `A2E_API_KEY`, `HEDRA_API_KEY`) are
+optional and protected. To allow the proxy to use them, configure
+`APP_PROXY_TOKEN` and have the caller send the same value in
+`x-app-token`. Without that token, environment keys are never used.
 
 ## Environment variables
 
@@ -50,8 +53,11 @@ token, environment keys are never used.
 | `APP_PROXY_TOKEN` | unset | Token required to use env-stored provider keys |
 | `OPENAI_API_KEY` | unset | Protected OpenAI key |
 | `A2E_API_KEY` | unset | Protected A2E key |
+| `HEDRA_API_KEY` | unset | Protected Hedra key |
 | `OPENAI_BASE_URL` | `https://api.openai.com` | Override for OpenAI routing |
 | `A2E_BASE_URL` | `https://video.a2e.ai` | A2E upstream |
+| `HEDRA_BASE_URL` | `https://api.hedra.com/web-app/public` | Hedra upstream |
+| `HEDRA_VIDEO_MODEL_SLUG` | `fal/grok-video-i2v` | Hedra model used for `/hedra/video` (image + text prompt, no audio asset) |
 | `UPSTREAM_TIMEOUT_MS` | `120000` | Provider timeout (AbortController on upstream) |
 | `MAX_IMAGE_BYTES` | `10 MB` | Maximum reference image size |
 | `ALBUM_DIR` | `data/album` | Where to store album assets |
